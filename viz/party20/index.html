@@ -1,0 +1,715 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Beat Tracking Visualizer</title>
+<style>
+  /* Page chrome. Canvas colours live in CONFIG.colors in the script below. */
+  :root {
+    --bg: #0f1115;
+    --surface: #171b23;
+    --border: #2a303c;
+    --text: #e6e8ec;
+    --muted: #8a93a3;
+    --accent: #4fd1c5;
+    --font: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.4 var(--font); }
+  header { padding: 18px 20px 6px; display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap; }
+  header h1 { margin: 0; font-size: 20px; font-weight: 600; }
+  header .sub { color: var(--muted); font-size: 13px; }
+  #toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 8px 20px 12px; }
+  #toolbar .spacer { flex: 1; }
+  button, select {
+    font: inherit; color: var(--text); background: var(--surface);
+    border: 1px solid var(--border); border-radius: 6px; padding: 5px 12px; cursor: pointer;
+  }
+  button:hover, select:hover { border-color: var(--muted); }
+  #play { min-width: 92px; }
+  #clock, #zoom-label { font-family: var(--mono); font-size: 13px; color: var(--muted); }
+  label { color: var(--muted); display: inline-flex; align-items: center; gap: 6px; }
+  #view, #overview-wrap { padding: 0 0; }
+  canvas { display: block; touch-action: none; }
+  #main { cursor: crosshair; }
+  #main.dragging { cursor: grabbing; }
+  #overview { cursor: pointer; }
+  #status {
+    display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap;
+    padding: 8px 20px 16px; font-family: var(--mono); font-size: 12px; color: var(--muted);
+  }
+  #missing { margin: 40px 20px; padding: 16px 20px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
+  #missing code { font-family: var(--mono); color: var(--accent); }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title">Beat tracking</h1>
+  <span class="sub">Ellis (2007), Beat Tracking by Dynamic Programming</span>
+</header>
+
+<div id="missing" hidden>
+  No data found. From the project root run
+  <code>python export_viz.py "audio/Party 20s.mp3"</code>
+  and reload this page.
+</div>
+
+<div id="app">
+  <div id="toolbar">
+    <button id="play" title="Play / pause (Space)">▶ Play</button>
+    <span id="clock">0:00.000 / 0:00.000</span>
+    <label>Speed
+      <select id="rate">
+        <option value="0.25">0.25×</option>
+        <option value="0.5">0.5×</option>
+        <option value="0.75">0.75×</option>
+        <option value="1" selected>1×</option>
+      </select>
+    </label>
+    <label title="Keep the playhead in view while playing (F)"><input type="checkbox" id="follow" checked> Follow playhead</label>
+    <span class="spacer"></span>
+    <button id="zoom-out" title="Zoom out (−)">−</button>
+    <span id="zoom-label"></span>
+    <button id="zoom-in" title="Zoom in (+)">+</button>
+    <button id="zoom-fit" title="Show everything (0)">Fit</button>
+  </div>
+  <div id="view"><canvas id="main"></canvas></div>
+  <div id="overview-wrap"><canvas id="overview"></canvas></div>
+  <div id="status">
+    <span id="hover-info">&nbsp;</span>
+    <span>drag / scroll: pan · ⌘/Ctrl + scroll or pinch: zoom · click: seek · Space: play</span>
+  </div>
+</div>
+
+<audio id="audio" preload="auto"></audio>
+<script src="data.js"></script>
+<script>
+// ============================================================================
+// CONFIG: everything that controls the look. Edit and reload.
+// ============================================================================
+const CONFIG = {
+  // Spectrogram
+  colormap: 'magma',        // 'magma' | 'viridis' | 'gray'
+  specDbRange: 50,          // show this many dB below the loudest bin; quieter is the darkest colour
+  specGamma: 1.0,           // <1 brightens quiet detail, >1 emphasises loud parts
+
+  // Layout (CSS px)
+  layout: { left: 72, right: 20, top: 8, onsetH: 170, gap: 10, specH: 300, axisH: 30 },
+  overviewH: 48,
+
+  // Onset envelope
+  onsetLineWidth: 1.5,
+  onsetYMax: null,          // null = auto (envelope max); a number clips taller peaks
+  showPointsAtPxPerFrame: 6,  // draw a dot per frame when zoomed in this far
+  frameGridAtPxPerFrame: 8,   // draw frame boundaries when zoomed in this far
+
+  // Zoom / view
+  initialViewSec: 8,        // seconds visible on load
+  maxPxPerFrame: 60,        // zoom-in limit
+  minTickPx: 80,            // minimum spacing between time-axis labels
+  followAt: 0.3,            // playhead position (fraction of width) while following
+
+  // Shift the drawn playhead to compensate for output latency (e.g. Bluetooth/HDMI)
+  audioLatencyMs: 0,
+
+  font: '12px ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif',
+  titleFont: '600 12px ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif',
+
+  colors: {
+    bg: '#0f1115',
+    panel: '#151922',
+    panelBorder: '#2a303c',
+    grid: 'rgba(255,255,255,0.07)',
+    frameGrid: 'rgba(255,255,255,0.12)',
+    text: '#c9ced8',
+    muted: '#7d8696',
+    onset: '#4fd1c5',
+    onsetFill: 'rgba(79,209,197,0.16)',
+    zero: 'rgba(255,255,255,0.28)',
+    playhead: '#ff4d6d',
+    hover: 'rgba(255,255,255,0.45)',
+    titleBg: 'rgba(15,17,21,0.72)',
+    overviewWindow: 'rgba(255,255,255,0.10)',
+    overviewWindowBorder: 'rgba(255,255,255,0.55)',
+  },
+};
+
+(() => {
+'use strict';
+
+const D = window.VIZ_DATA;
+if (!D) {
+  document.getElementById('missing').hidden = false;
+  document.getElementById('app').hidden = true;
+  return;
+}
+
+// ----------------------------------------------------------------------------
+// Data
+// ----------------------------------------------------------------------------
+function b64ToBytes(s) {
+  const bin = atob(s), out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+const C = CONFIG.colors, LY = CONFIG.layout;
+const fr = D.frameRate, hop = 1 / fr, half = D.winSec / 2;
+const T = D.nFrames, M = D.nMels, duration = D.duration;
+const mel = b64ToBytes(D.melDb.data);                        // T*M, frame-major
+const onset = new Float32Array(b64ToBytes(D.onset).buffer);  // T-1
+const NO = onset.length;
+
+// Time conventions (match beat_analysis.frames_to_time):
+//   STFT column j is centred at j*hop + win/2
+//   onset frame k = diff between columns k and k+1, placed at column k+1
+const specTime = j => j * hop + half;
+const onsetTime = k => (k + 1) * hop + half;
+const onsetFrameAt = t => Math.round((t - half) * fr) - 1;
+const specColAt = t => Math.round((t - half) * fr);
+
+let oMin = Infinity, oMax = -Infinity;
+for (let i = 0; i < NO; i++) { const v = onset[i]; if (v < oMin) oMin = v; if (v > oMax) oMax = v; }
+const oLo = Math.min(0, oMin) * 1.05;
+const oHi = CONFIG.onsetYMax ?? oMax * 1.05;
+
+document.getElementById('title').textContent = D.title;
+document.title = 'Beats: ' + D.title;
+
+// ----------------------------------------------------------------------------
+// Colormap -> 256-entry LUT indexed by the quantised dB byte
+// (magma/viridis: polynomial fits by Matt Zucker, CC0)
+// ----------------------------------------------------------------------------
+const CMAPS = {
+  magma: [
+    [-0.002136485053939582, -0.000749655052795221, -0.005386127855323933],
+    [0.2516605407371642, 0.6775232436837668, 2.494026599312351],
+    [8.353717279216625, -3.577719514958484, 0.3144679030132573],
+    [-27.66873308576866, 14.26473078096533, -13.64921318813922],
+    [52.17613981234068, -27.94360607168351, 12.94416944238394],
+    [-50.76852536473588, 29.04658282127291, 4.23415299384598],
+    [18.65570506591883, -11.48977351997711, -5.601961508734096]],
+  viridis: [
+    [0.2777273272234177, 0.005407344544966578, 0.3340998053353061],
+    [0.1050930431085774, 1.404613529898575, 1.384590162594685],
+    [-0.3308618287255563, 0.214847559468213, 0.09509516302823659],
+    [-4.634230498983486, -5.799100973351585, -19.33244095627987],
+    [6.228269936347081, 14.17993336680509, 56.69055260068105],
+    [4.776384997670288, -13.74514537774601, -65.35303263337234],
+    [-5.435455855934631, 4.645852612178535, 26.3124352495832]],
+};
+function colormap(t) {
+  const c = CMAPS[CONFIG.colormap];
+  if (!c) return [t, t, t];
+  const rgb = [0, 0, 0];
+  for (let ch = 0; ch < 3; ch++) {
+    let v = c[6][ch];
+    for (let i = 5; i >= 0; i--) v = v * t + c[i][ch];
+    rgb[ch] = v;
+  }
+  return rgb;
+}
+const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+const LUT = new Uint8Array(256 * 4);
+{
+  const dbMin = D.melDb.min, dbMax = D.melDb.max, range = CONFIG.specDbRange;
+  for (let v = 0; v < 256; v++) {
+    const db = dbMin + v / 255 * (dbMax - dbMin);
+    const t = Math.pow(clamp((db - (dbMax - range)) / range, 0, 1), CONFIG.specGamma);
+    const [r, g, b] = colormap(t);
+    LUT[v * 4] = Math.round(clamp(r, 0, 1) * 255);
+    LUT[v * 4 + 1] = Math.round(clamp(g, 0, 1) * 255);
+    LUT[v * 4 + 2] = Math.round(clamp(b, 0, 1) * 255);
+    LUT[v * 4 + 3] = 255;
+  }
+}
+
+// ----------------------------------------------------------------------------
+// Spectrogram pyramid: level l max-pools 2^l frames per column. Each level is
+// split into TILE-column canvases (browsers cap canvas width), built lazily.
+// ----------------------------------------------------------------------------
+const TILE = 2048;
+const levels = [{ data: mel, n: T, tiles: [] }];
+function getLevel(l) {
+  while (levels.length <= l) {
+    const p = levels[levels.length - 1];
+    const n = Math.ceil(p.n / 2), d = new Uint8Array(n * M);
+    for (let i = 0; i < n; i++) {
+      const a = 2 * i * M, b = a + M, hasB = 2 * i + 1 < p.n;
+      for (let m = 0; m < M; m++) {
+        const va = p.data[a + m];
+        d[i * M + m] = hasB ? Math.max(va, p.data[b + m]) : va;
+      }
+    }
+    levels.push({ data: d, n, tiles: [] });
+  }
+  return levels[l];
+}
+function getTile(lv, ti) {
+  if (lv.tiles[ti]) return lv.tiles[ti];
+  const c0 = ti * TILE, w = Math.min(TILE, lv.n - c0);
+  const can = document.createElement('canvas');
+  can.width = w; can.height = M;
+  const g = can.getContext('2d'), img = g.createImageData(w, M), px = img.data;
+  for (let c = 0; c < w; c++) {
+    const base = (c0 + c) * M;
+    for (let m = 0; m < M; m++) {
+      const k = lv.data[base + m] * 4, o = ((M - 1 - m) * w + c) * 4;  // low bands at bottom
+      px[o] = LUT[k]; px[o + 1] = LUT[k + 1]; px[o + 2] = LUT[k + 2]; px[o + 3] = 255;
+    }
+  }
+  g.putImageData(img, 0, 0);
+  return (lv.tiles[ti] = can);
+}
+
+// ----------------------------------------------------------------------------
+// View state & geometry
+// ----------------------------------------------------------------------------
+const audio = document.getElementById('audio');
+const viewEl = document.getElementById('view');
+const cv = document.getElementById('main'), ctx = cv.getContext('2d');
+const ov = document.getElementById('overview'), octx = ov.getContext('2d');
+const followBox = document.getElementById('follow');
+
+const state = { t0: 0, pps: NaN, follow: true, hoverX: null, hoverY: null };
+const geo = {};
+let W = 0, H = 0, dpr = 1, minPps = 1, dirty = true;
+const maxPps = CONFIG.maxPxPerFrame * fr;
+
+function sizeCanvas(c, w, h) {
+  c.width = Math.round(w * dpr); c.height = Math.round(h * dpr);
+  c.style.width = w + 'px'; c.style.height = h + 'px';
+}
+function layout() {
+  dpr = window.devicePixelRatio || 1;
+  W = viewEl.clientWidth;
+  geo.L = LY.left; geo.R = W - LY.right; geo.pw = geo.R - geo.L;
+  geo.oy0 = LY.top; geo.oy1 = geo.oy0 + LY.onsetH;
+  geo.sy0 = geo.oy1 + LY.gap; geo.sy1 = geo.sy0 + LY.specH;
+  geo.ay1 = geo.sy1 + LY.axisH;
+  H = geo.ay1;
+  sizeCanvas(cv, W, H);
+  sizeCanvas(ov, W, CONFIG.overviewH);
+  minPps = geo.pw / duration;
+  if (!isFinite(state.pps)) state.pps = geo.pw / Math.min(CONFIG.initialViewSec, duration);
+  state.pps = clamp(state.pps, minPps, maxPps);
+  clampView();
+  dirty = true;
+}
+const visSec = () => geo.pw / state.pps;
+const xOf = t => geo.L + (t - state.t0) * state.pps;
+const tOf = x => state.t0 + (x - geo.L) / state.pps;
+const snap = x => Math.round(x * dpr) / dpr;
+function clampView() { state.t0 = clamp(state.t0, 0, Math.max(0, duration - visSec())); }
+
+// ----------------------------------------------------------------------------
+// Playback clock (interpolated between the browser's currentTime updates)
+// ----------------------------------------------------------------------------
+let lastCT = -1, lastPerf = 0;
+function playTime() {
+  const ct = audio.currentTime;
+  if (audio.paused) { lastCT = ct; return ct; }
+  const now = performance.now();
+  if (ct !== lastCT) { lastCT = ct; lastPerf = now; return ct; }
+  return Math.min(ct + (now - lastPerf) / 1000 * audio.playbackRate, ct + 0.1);
+}
+const displayTime = () => playTime() - (audio.paused ? 0 : CONFIG.audioLatencyMs / 1000);
+
+// ----------------------------------------------------------------------------
+// Drawing
+// ----------------------------------------------------------------------------
+const TIME_STEPS = [0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.25, 0.5, 1, 2, 5, 10, 15, 30, 60, 120];
+function timeStep() {
+  for (const s of TIME_STEPS) if (s * state.pps >= CONFIG.minTickPx) return s;
+  return 300;
+}
+function fmtTime(t, dec) {
+  const m = Math.floor(t / 60), s = t - 60 * m;
+  return m > 0 ? `${m}:${s.toFixed(dec).padStart(dec ? dec + 3 : 2, '0')}` : `${s.toFixed(dec)} s`;
+}
+function fmtClock(t) {
+  const m = Math.floor(t / 60), s = t - 60 * m;
+  return `${m}:${s.toFixed(3).padStart(6, '0')}`;
+}
+const hzToMel = f => 2595 * Math.log10(1 + f / 700);
+const onsetY = v => geo.oy1 - (v - oLo) / (oHi - oLo) * (geo.oy1 - geo.oy0);
+
+function panelTitle(text, y) {
+  ctx.font = CONFIG.titleFont;
+  const w = ctx.measureText(text).width;
+  ctx.fillStyle = C.titleBg;
+  ctx.fillRect(geo.L + 6, y + 6, w + 12, 20);
+  ctx.fillStyle = C.text;
+  ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+  ctx.fillText(text, geo.L + 12, y + 16);
+}
+
+function drawSpectrogram() {
+  const { L, pw, sy0 } = geo, specH = LY.specH;
+  const ppf = state.pps * hop;
+  const l = ppf >= 1 ? 0 : Math.ceil(Math.log2(1 / ppf));
+  const lv = getLevel(l), colSec = (1 << l) * hop;
+  const edge0 = half - hop / 2;                   // left edge of column 0
+  const t1 = state.t0 + visSec();
+  const c0 = Math.max(0, Math.floor((state.t0 - edge0) / colSec));
+  const c1 = Math.min(lv.n - 1, Math.ceil((t1 - edge0) / colSec));
+  ctx.save();
+  ctx.beginPath(); ctx.rect(L, sy0, pw, specH); ctx.clip();
+  ctx.imageSmoothingEnabled = false;
+  for (let ti = Math.floor(c0 / TILE); ti <= Math.floor(c1 / TILE); ti++) {
+    const tile = getTile(lv, ti), cs = ti * TILE;
+    const a = Math.max(c0, cs), b = Math.min(c1 + 1, cs + tile.width);   // [a, b) columns
+    if (b <= a) continue;
+    const xa = snap(xOf(edge0 + a * colSec)), xb = snap(xOf(edge0 + b * colSec));
+    ctx.drawImage(tile, a - cs, 0, b - a, M, xa, sy0, xb - xa, specH);
+  }
+  ctx.restore();
+}
+
+function drawOnset() {
+  const { L, R, pw, oy0 } = geo;
+  const ppf = state.pps * hop, t1 = state.t0 + visSec();
+  const kA = clamp(onsetFrameAt(state.t0) - 2, 0, NO - 1);
+  const kB = clamp(onsetFrameAt(t1) + 2, 0, NO - 1);
+  const y0 = onsetY(0);
+  ctx.save();
+  ctx.beginPath(); ctx.rect(L, oy0, pw, LY.onsetH); ctx.clip();
+
+  // zero line
+  ctx.strokeStyle = C.zero; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(L, snap(y0) + 0.5 / dpr); ctx.lineTo(R, snap(y0) + 0.5 / dpr); ctx.stroke();
+
+  if (ppf >= 1) {
+    const trace = () => {
+      ctx.beginPath();
+      for (let k = kA; k <= kB; k++) {
+        const x = xOf(onsetTime(k)), y = onsetY(onset[k]);
+        k === kA ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+      }
+    };
+    trace();
+    ctx.lineTo(xOf(onsetTime(kB)), y0); ctx.lineTo(xOf(onsetTime(kA)), y0); ctx.closePath();
+    ctx.fillStyle = C.onsetFill; ctx.fill();
+    trace();
+    ctx.strokeStyle = C.onset; ctx.lineWidth = CONFIG.onsetLineWidth; ctx.lineJoin = 'round';
+    ctx.stroke();
+    if (ppf >= CONFIG.showPointsAtPxPerFrame) {
+      ctx.fillStyle = C.onset;
+      const r = Math.min(3.5, 1 + ppf / 12);
+      ctx.beginPath();
+      for (let k = kA; k <= kB; k++) {
+        const x = xOf(onsetTime(k)), y = onsetY(onset[k]);
+        ctx.moveTo(x + r, y); ctx.arc(x, y, r, 0, 2 * Math.PI);
+      }
+      ctx.fill();
+    }
+  } else {
+    // Zoomed out: per-pixel min/max so no peak is ever skipped.
+    let k = kA;
+    const step = 1 / dpr;
+    while (k <= kB && onsetTime(k) < tOf(L)) k++;
+    for (let x = L; x < R; x += step) {
+      const tb = tOf(x + step);
+      let lo = Infinity, hi = -Infinity;
+      while (k <= kB && onsetTime(k) < tb) { const v = onset[k++]; if (v < lo) lo = v; if (v > hi) hi = v; }
+      if (hi === -Infinity) continue;
+      const yh = onsetY(hi), yl = onsetY(lo);
+      ctx.fillStyle = C.onsetFill;
+      ctx.fillRect(x, Math.min(yh, y0), step, Math.abs(Math.max(yl, y0) - Math.min(yh, y0)));
+      ctx.fillStyle = C.onset;
+      ctx.fillRect(x, yh, step, Math.max(CONFIG.onsetLineWidth, yl - yh));
+    }
+  }
+  ctx.restore();
+}
+
+function drawGridAndAxes() {
+  const { L, R, oy0, oy1, sy0, sy1, ay1 } = geo;
+  const step = timeStep(), t1 = state.t0 + visSec();
+  const dec = Math.max(0, Math.ceil(-Math.log10(step) - 1e-9));
+  ctx.font = CONFIG.font;
+
+  // vertical time grid + labels
+  ctx.strokeStyle = C.grid; ctx.lineWidth = 1;
+  ctx.fillStyle = C.muted; ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+  ctx.beginPath();
+  for (let t = Math.ceil(state.t0 / step) * step; t <= t1 + 1e-9; t += step) {
+    const x = snap(xOf(t)) + 0.5 / dpr;
+    ctx.moveTo(x, oy0); ctx.lineTo(x, oy1);
+    ctx.moveTo(x, sy0); ctx.lineTo(x, sy1 + 4);
+    ctx.fillText(fmtTime(t, dec), x, sy1 + 8);
+  }
+  ctx.stroke();
+
+  // frame boundaries when zoomed in
+  const ppf = state.pps * hop;
+  if (ppf >= CONFIG.frameGridAtPxPerFrame) {
+    ctx.strokeStyle = C.frameGrid;
+    ctx.beginPath();
+    for (let j = specColAt(state.t0); j <= specColAt(t1) + 1; j++) {
+      const x = snap(xOf(specTime(j) - hop / 2)) + 0.5 / dpr;
+      ctx.moveTo(x, oy0); ctx.lineTo(x, oy1);
+      ctx.moveTo(x, sy0); ctx.lineTo(x, sy1);
+    }
+    ctx.stroke();
+  }
+
+  // onset y-axis
+  ctx.textAlign = 'right'; ctx.textBaseline = 'middle'; ctx.fillStyle = C.muted;
+  const ys = [0.5, 1, 2, 5, 10, 20].find(s => (oHi - oLo) / s <= 6) ?? 50;
+  for (let v = Math.ceil(oLo / ys) * ys; v <= oHi; v += ys) {
+    const y = onsetY(v);
+    if (y < oy0 + 6 || y > oy1 - 2) continue;
+    ctx.fillText(Number(v.toFixed(2)).toString(), L - 8, y);
+  }
+
+  // spectrogram frequency axis (mel-spaced bands)
+  const melStep = hzToMel(D.melMaxHz) / (M + 1);   // band b centred at (b+1)*melStep
+  for (const f of [100, 250, 500, 1000, 2000, 3500]) {
+    const idx = hzToMel(f) / melStep - 1;
+    const y = sy1 - (idx + 0.5) / M * LY.specH;
+    if (y < sy0 + 4 || y > sy1 - 4) continue;
+    ctx.fillText(f >= 1000 ? `${f / 1000}k` : `${f}`, L - 8, y);
+  }
+  ctx.save();
+  ctx.translate(14, (sy0 + sy1) / 2); ctx.rotate(-Math.PI / 2);
+  ctx.textAlign = 'center'; ctx.fillText('Hz', 0, 0);
+  ctx.restore();
+  ctx.save();
+  ctx.translate(14, (oy0 + oy1) / 2); ctx.rotate(-Math.PI / 2);
+  ctx.textAlign = 'center'; ctx.fillText('O(t)', 0, 0);
+  ctx.restore();
+
+  // panel borders
+  ctx.strokeStyle = C.panelBorder;
+  ctx.strokeRect(L - 0.5, oy0 - 0.5, R - L + 1, oy1 - oy0 + 1);
+  ctx.strokeRect(L - 0.5, sy0 - 0.5, R - L + 1, sy1 - sy0 + 1);
+}
+
+function drawCursors() {
+  const { L, R, oy0, sy1 } = geo;
+  // hover
+  if (state.hoverX !== null && state.hoverX >= L && state.hoverX <= R) {
+    const t = tOf(state.hoverX);
+    const k = clamp(onsetFrameAt(t), 0, NO - 1);
+    const x = snap(xOf(onsetTime(k))) + 0.5 / dpr;
+    ctx.strokeStyle = C.hover; ctx.lineWidth = 1; ctx.setLineDash([3, 3]);
+    ctx.beginPath(); ctx.moveTo(x, oy0); ctx.lineTo(x, sy1); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.strokeStyle = C.text; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.arc(xOf(onsetTime(k)), onsetY(onset[k]), 4.5, 0, 2 * Math.PI); ctx.stroke();
+  }
+  // playhead
+  const tp = displayTime();
+  const x = xOf(tp);
+  if (x >= L - 1 && x <= R + 1) {
+    ctx.strokeStyle = C.playhead; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(x, oy0); ctx.lineTo(x, sy1); ctx.stroke();
+    ctx.fillStyle = C.playhead;
+    ctx.beginPath(); ctx.moveTo(x - 6, oy0 - 1); ctx.lineTo(x + 6, oy0 - 1); ctx.lineTo(x, oy0 + 7); ctx.fill();
+  }
+}
+
+function drawMain() {
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = C.bg; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = C.panel;
+  ctx.fillRect(geo.L, geo.oy0, geo.pw, LY.onsetH);
+  ctx.fillRect(geo.L, geo.sy0, geo.pw, LY.specH);
+  drawSpectrogram();
+  drawOnset();
+  drawGridAndAxes();
+  panelTitle('Onset strength envelope  O(t)', geo.oy0);
+  panelTitle(`Mel spectrogram  ·  ${M} bands  ·  dB`, geo.sy0);
+  drawCursors();
+}
+
+function drawOverview() {
+  const OH = CONFIG.overviewH, { L, R, pw } = geo;
+  octx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  octx.fillStyle = C.bg; octx.fillRect(0, 0, W, OH);
+  octx.fillStyle = C.panel; octx.fillRect(L, 2, pw, OH - 4);
+  // whole-song envelope, per-pixel max
+  const top = 4, bot = OH - 4, yOf = v => bot - clamp((v - oLo) / (oHi - oLo), 0, 1) * (bot - top);
+  const step = 1 / dpr, secPerPx = duration / pw;
+  octx.fillStyle = C.onset;
+  let k = 0;
+  for (let x = L; x < R; x += step) {
+    const tb = (x + step - L) * secPerPx;
+    let hi = -Infinity;
+    while (k < NO && onsetTime(k) < tb) { const v = onset[k++]; if (v > hi) hi = v; }
+    if (hi === -Infinity) continue;
+    const y = yOf(hi), y0 = yOf(Math.max(0, oLo));
+    octx.fillRect(x, y, step, Math.max(step, y0 - y));
+  }
+  // visible window
+  const xa = L + state.t0 / duration * pw, xb = L + (state.t0 + visSec()) / duration * pw;
+  octx.fillStyle = C.overviewWindow; octx.fillRect(xa, 1, xb - xa, OH - 2);
+  octx.strokeStyle = C.overviewWindowBorder; octx.lineWidth = 1;
+  octx.strokeRect(snap(xa) + 0.5 / dpr, 1.5, Math.max(2, xb - xa - 1), OH - 3);
+  // playhead
+  const xp = L + displayTime() / duration * pw;
+  octx.fillStyle = C.playhead; octx.fillRect(xp - 1, 0, 2, OH);
+}
+
+// ----------------------------------------------------------------------------
+// UI
+// ----------------------------------------------------------------------------
+const playBtn = document.getElementById('play');
+const clockEl = document.getElementById('clock');
+const zoomLabel = document.getElementById('zoom-label');
+const hoverInfo = document.getElementById('hover-info');
+
+function updateLabels() {
+  clockEl.textContent = `${fmtClock(Math.max(0, displayTime()))} / ${fmtClock(duration)}`;
+  const ppf = state.pps * hop;
+  zoomLabel.textContent = `${ppf < 1 ? ppf.toFixed(2) : ppf.toFixed(1)} px/frame · ${visSec().toFixed(1)} s`;
+}
+function updateHover() {
+  if (state.hoverX === null || state.hoverX < geo.L || state.hoverX > geo.R) {
+    hoverInfo.innerHTML = '&nbsp;'; return;
+  }
+  const t = tOf(state.hoverX);
+  const k = clamp(onsetFrameAt(t), 0, NO - 1);
+  let s = `t = ${onsetTime(k).toFixed(3)} s · frame ${k} · O = ${onset[k].toFixed(3)}`;
+  const y = state.hoverY;
+  if (y >= geo.sy0 && y < geo.sy1) {
+    const band = clamp(Math.floor((geo.sy1 - y) / LY.specH * M), 0, M - 1);
+    const j = clamp(specColAt(t), 0, T - 1);
+    const db = mel[j * M + band] / 255 * (D.melDb.max - D.melDb.min) + D.melDb.min - D.melDb.max;
+    s += ` · band ${band} (≈${Math.round(D.melCentersHz[band])} Hz) · ${db.toFixed(1)} dB re max`;
+  }
+  hoverInfo.textContent = s;
+}
+function setFollow(on) { state.follow = on; followBox.checked = on; dirty = true; }
+function seek(t) {
+  audio.currentTime = clamp(t, 0, duration);
+  lastCT = -1;
+  dirty = true;
+}
+function togglePlay() {
+  if (audio.paused) {
+    if (audio.currentTime >= duration - 0.01) audio.currentTime = 0;
+    audio.play();
+  } else audio.pause();
+}
+function zoomAt(factor, x) {
+  const t = tOf(x);
+  state.pps = clamp(state.pps * factor, minPps, maxPps);
+  state.t0 = t - (x - geo.L) / state.pps;
+  clampView(); dirty = true;
+}
+function zoomButton(factor) {
+  const xp = xOf(displayTime());
+  zoomAt(factor, xp >= geo.L && xp <= geo.R ? xp : (geo.L + geo.R) / 2);
+}
+function fit() { state.pps = minPps; state.t0 = 0; dirty = true; }
+
+audio.src = D.audio;
+audio.addEventListener('play', () => { playBtn.textContent = '❚❚ Pause'; dirty = true; });
+audio.addEventListener('pause', () => { playBtn.textContent = '▶ Play'; dirty = true; });
+audio.addEventListener('seeked', () => { dirty = true; });
+audio.addEventListener('error', () => {
+  hoverInfo.textContent = `Could not load audio "${decodeURI(D.audio)}" (relative to viz/).`;
+});
+
+playBtn.addEventListener('click', () => { togglePlay(); playBtn.blur(); });
+document.getElementById('rate').addEventListener('change', e => { audio.playbackRate = +e.target.value; e.target.blur(); });
+followBox.addEventListener('change', () => { setFollow(followBox.checked); followBox.blur(); });
+document.getElementById('zoom-in').addEventListener('click', e => { zoomButton(1.5); e.target.blur(); });
+document.getElementById('zoom-out').addEventListener('click', e => { zoomButton(1 / 1.5); e.target.blur(); });
+document.getElementById('zoom-fit').addEventListener('click', e => { fit(); e.target.blur(); });
+
+// main canvas: drag to pan, click to seek, wheel to pan/zoom
+let drag = null;
+const localXY = e => { const r = cv.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; };
+cv.addEventListener('pointerdown', e => {
+  cv.setPointerCapture(e.pointerId);
+  drag = { x: e.clientX, t0: state.t0, moved: false };
+});
+cv.addEventListener('pointermove', e => {
+  [state.hoverX, state.hoverY] = localXY(e);
+  if (drag) {
+    const dx = e.clientX - drag.x;
+    if (Math.abs(dx) > 3) { drag.moved = true; cv.classList.add('dragging'); }
+    if (drag.moved) {
+      state.t0 = drag.t0 - dx / state.pps; clampView();
+      if (!audio.paused) setFollow(false);
+    }
+  }
+  updateHover(); dirty = true;
+});
+cv.addEventListener('pointerup', e => {
+  if (drag && !drag.moved) {
+    const [x] = localXY(e);
+    if (x >= geo.L && x <= geo.R) seek(tOf(x));
+  }
+  drag = null; cv.classList.remove('dragging');
+});
+cv.addEventListener('pointerleave', () => { state.hoverX = null; updateHover(); dirty = true; });
+cv.addEventListener('wheel', e => {
+  e.preventDefault();
+  const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? geo.pw : 1;
+  const dx = e.deltaX * unit, dy = e.deltaY * unit;
+  if (e.ctrlKey || e.metaKey) {
+    zoomAt(Math.exp(-dy * 0.01), localXY(e)[0]);
+  } else {
+    state.t0 += (Math.abs(dx) > Math.abs(dy) ? dx : dy) / state.pps;
+    clampView();
+  }
+  if (!audio.paused) setFollow(false);
+  dirty = true;
+}, { passive: false });
+
+// overview: click / drag to move the window
+let ovDrag = false;
+function overviewTo(e) {
+  const x = e.clientX - ov.getBoundingClientRect().left;
+  state.t0 = (x - geo.L) / geo.pw * duration - visSec() / 2;
+  clampView();
+  if (!audio.paused) setFollow(false);
+  dirty = true;
+}
+ov.addEventListener('pointerdown', e => { ov.setPointerCapture(e.pointerId); ovDrag = true; overviewTo(e); });
+ov.addEventListener('pointermove', e => { if (ovDrag) overviewTo(e); });
+ov.addEventListener('pointerup', () => { ovDrag = false; });
+
+window.addEventListener('keydown', e => {
+  if (e.target.tagName === 'SELECT' || e.target.tagName === 'INPUT' || e.metaKey || e.ctrlKey) return;
+  switch (e.key) {
+    case ' ': e.preventDefault(); togglePlay(); break;
+    case '+': case '=': zoomButton(1.5); break;
+    case '-': case '_': zoomButton(1 / 1.5); break;
+    case '0': fit(); break;
+    case 'f': case 'F': setFollow(!state.follow); break;
+    case 'Home': seek(0); state.t0 = 0; break;
+  }
+});
+window.addEventListener('resize', layout);
+
+// ----------------------------------------------------------------------------
+// Render loop: redraw only when something changed or audio is playing
+// ----------------------------------------------------------------------------
+function frame() {
+  if (!audio.paused) {
+    if (state.follow) {
+      state.t0 = displayTime() - CONFIG.followAt * visSec();
+      clampView();
+    }
+    dirty = true;
+  }
+  if (dirty) {
+    dirty = false;
+    drawMain();
+    drawOverview();
+    updateLabels();
+  }
+  requestAnimationFrame(frame);
+}
+layout();
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

@@ -102,11 +102,11 @@ def mel_filterbank(sr: int, n_fft: int, n_mels: int = N_MELS) -> np.ndarray:
     return weights
 
 
-def onset_strength_envelope(y: np.ndarray, sr: int) -> tuple[np.ndarray, float]:
-    """Compute O(t) as described in section 3.1.
+def mel_spectrogram_db(y: np.ndarray, sr: int) -> tuple[np.ndarray, float]:
+    """First half of section 3.1: 8 kHz resample, STFT, 40 Mel bands in dB.
 
-    Returns (onset_envelope, frame_rate_hz). The envelope is normalized to unit
-    standard deviation.
+    Returns (mel_db, frame_rate_hz). mel_db has shape (N_MELS, T); column j is
+    the STFT frame centred at j / frame_rate + WIN_SEC / 2 seconds.
     """
     # Resample to 8 kHz
     if sr != TARGET_SR:
@@ -127,13 +127,22 @@ def onset_strength_envelope(y: np.ndarray, sr: int) -> tuple[np.ndarray, float]:
     mel = mel_filterbank(TARGET_SR, n_win) @ spec
     mel_db = 20.0 * np.log10(np.maximum(mel, 1e-10))
     mel_db = np.maximum(mel_db, mel_db.max() - DB_FLOOR)
+    return mel_db, TARGET_SR / n_hop
+
+
+def onset_strength_envelope(y: np.ndarray, sr: int) -> tuple[np.ndarray, float]:
+    """Compute O(t) as described in section 3.1.
+
+    Returns (onset_envelope, frame_rate_hz). The envelope is normalized to unit
+    standard deviation.
+    """
+    mel_db, frame_rate = mel_spectrogram_db(y, sr)
 
     # First-order difference in time, half-wave rectify, sum across bands
     onset = np.maximum(0.0, np.diff(mel_db, axis=1)).sum(axis=0)
 
     # High-pass filter (~0.4 Hz) to make it locally zero-mean.
     # One-pole/one-zero DC blocker: pole p gives cutoff ~ (1-p)*fs/(2*pi).
-    frame_rate = TARGET_SR / n_hop
     pole = 1.0 - 2.0 * np.pi * HPF_CUTOFF_HZ / frame_rate
     onset = lfilter([1.0, -1.0], [1.0, -pole], onset)
 
@@ -217,12 +226,13 @@ def dp_beat_track(localscore: np.ndarray, period: float,
     cumscore = localscore.astype(float).copy()   # C*(t)
 
     # Search range for previous beat, and log-Gaussian transition cost over it
+    # Create an array of all the offsets we need to search for the previous beat
     prange = np.arange(-round(2 * period), -round(period / 2) + 1)
     txcost = -alpha * np.abs(np.log(prange / -period)) ** 2
 
     # Forward pass: O(N * |prange|) = O(N * tau_p) -> linear in N
     for i in range(-prange[0], n):
-        timerange = i + prange
+        timerange = i + prange  # array of timestamps we have to search for prev beat
         scorecands = txcost + cumscore[timerange]
         xx = int(np.argmax(scorecands))
         cumscore[i] = scorecands[xx] + localscore[i]
