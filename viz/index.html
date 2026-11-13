@@ -61,6 +61,21 @@
     display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap;
     padding: 8px 20px 16px; font-family: var(--mono); font-size: 12px; color: var(--muted);
   }
+  /* Forward-pass equation card (follows the hovered frame) */
+  #view { position: relative; }
+  #eqcard {
+    position: absolute; z-index: 2; pointer-events: none;
+    background: rgba(15,17,21,0.93); border: 1px solid var(--border); border-radius: 8px;
+    padding: 8px 12px 9px; box-shadow: 0 6px 18px rgba(0,0,0,0.45);
+    font-family: var(--mono); font-size: 12px; white-space: nowrap;
+  }
+  #eqcard .eq { display: grid; column-gap: 9px; row-gap: 1px; align-items: baseline; justify-items: center; }
+  #eqcard .sym { color: var(--muted); }
+  #eqcard .num { font-size: 15px; font-weight: 600; }
+  #eqcard .op { color: var(--muted); font-size: 14px; }
+  #eqcard .sub { color: var(--muted); font-size: 11px; }
+  #eqcard .note { margin-top: 7px; color: var(--muted); font: 12px/1.45 var(--font); }
+  #eqcard .note b { color: var(--text); font-weight: 600; }
   #missing { margin: 40px 20px; padding: 16px 20px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
   #missing code { font-family: var(--mono); color: var(--accent); }
 </style>
@@ -105,6 +120,8 @@
       </select>
     </label>
     <label title="Keep the playhead in view while playing (F)"><input type="checkbox" id="follow" checked> Follow playhead</label>
+    <label id="chain-wrap" title="On hover, show the whole best beat sequence ending at that frame (K)" hidden><input type="checkbox" id="show-chain"> Full chain</label>
+    <label id="eq-wrap" title="On hover, show the C*(t) equation with that frame's numbers (E)" hidden><input type="checkbox" id="show-eq"> Equation</label>
     <label id="clicks-wrap" title="Play a click on each revealed beat (C)" hidden><input type="checkbox" id="clicks"> Beat clicks</label>
     <label id="offset-wrap" title="Delay the clicks relative to the music. Raise it if clicks come early, lower it if they come late." hidden>
       offset <input type="range" id="click-offset" min="-150" max="400" step="5" style="width:110px">
@@ -116,7 +133,7 @@
     <button id="zoom-in" title="Zoom in (+)">+</button>
     <button id="zoom-fit" title="Show everything (0)">Fit</button>
   </div>
-  <div id="view"><canvas id="main"></canvas></div>
+  <div id="view"><canvas id="main"></canvas><div id="eqcard" hidden></div></div>
   <div id="overview-wrap"><canvas id="overview"></canvas></div>
   <div id="status">
     <span id="hover-info">&nbsp;</span>
@@ -174,6 +191,13 @@ const CONFIG = {
   },
   pulseMs: 300,             // how long the playhead glow lasts
 
+  // Forward pass hover: best chain ending at the hovered frame + equation card.
+  // These are the defaults for the "Full chain" / "Equation" checkboxes; once
+  // toggled, the checkbox state is remembered per browser.
+  showChain: true,
+  chainArcAlpha: 0.5,
+  showEqCard: true,
+
   font: '12px ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif',
   titleFont: '600 12px ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif',
   monoFont: '10.5px ui-monospace, "SF Mono", Menlo, Consolas, monospace',
@@ -201,6 +225,12 @@ const CONFIG = {
     window: 'rgba(147,197,253,0.10)',
     candidate: 'rgba(255,255,255,0.6)',
     hoverArc: '#ffffff',
+    tempoGuess: 'rgba(255,255,255,0.4)', // hover: t − τp, where the tempo alone puts the previous beat (C* panel only)
+    penalty: '#fca5a5',                // transition penalty α·log²(…) (card + mark at τ*)
+    chain: 'rgba(255,255,255,0.25)',     // hover: earlier beats of the best chain ending here
+    chainDot: 'rgba(255,255,255,0.85)',
+    chainArc: '#ffffff',                 // drawn at chainArcAlpha
+    chainOverview: 'rgba(255,255,255,0.75)',
     playhead: '#ff4d6d',
     hover: 'rgba(255,255,255,0.45)',
     pulseGlow: 'rgba(255,224,102,0.38)',
@@ -225,7 +255,8 @@ const CAPTIONS = {
     (${v.bpm} BPM). Left to right, for every frame t:
     <span class="math">C*(t) = O(t) + max<sub>τ∈[t−${v.w0}, t−${v.w1}]</sub> { C*(τ) − ${v.alpha}·log²((t−τ)/τ<sub>p</sub>) }</span>,
     and <span class="math">P*(t)</span> records the winning τ.
-    <i>Hover a frame</i> to see its search window, the candidate scores (dashed) and the chosen predecessor.`,
+    <i>Hover a frame</i> to see its search window, the candidate scores (dashed), the chosen predecessor,
+    and the whole best beat sequence ending there (faint lines): C*(t) is that sequence's total score.`,
   backtrace: v => v.prev >= 0
     ? `<b>4 · Backtrace</b>: step ${v.n} of ${v.B}. ${v.n === 1
         ? `Start at the frame with the <b>highest cumulative score</b>: `
@@ -621,12 +652,12 @@ function drawSeries(arr, p, yOf, o) {
 }
 
 // Curved arrow from (x1,y1) to (x2,y2), bowing upward, with a label at its apex.
-function arrowArc(p, x1, y1, x2, y2, color, label, labelColor) {
+function arrowArc(p, x1, y1, x2, y2, color, label, labelColor, lw = 2) {
   const lift = Math.max(26, Math.abs(x2 - x1) * 0.28);
   const cx = (x1 + x2) / 2, cy = Math.max(p.y0 + 4, Math.min(y1, y2) - lift);
-  ctx.strokeStyle = color; ctx.lineWidth = 2;
+  ctx.strokeStyle = color; ctx.lineWidth = lw;
   ctx.beginPath(); ctx.moveTo(x1, y1); ctx.quadraticCurveTo(cx, cy, x2, y2); ctx.stroke();
-  const ang = Math.atan2(y2 - cy, x2 - cx), s = 9;
+  const ang = Math.atan2(y2 - cy, x2 - cx), s = 4 + 2.5 * lw;
   ctx.fillStyle = color;
   ctx.beginPath();
   ctx.moveTo(x2, y2);
@@ -841,6 +872,15 @@ function drawSearchWindow() {
   for (const p of [pc, pb]) { clipPanel(p); ctx.fillRect(xa, p.y0, xb - xa, p.h); ctx.restore(); }
 
   clipPanel(pc);
+  // Where the tempo estimate alone would put the previous beat: exactly τp
+  // frames back (zero transition penalty). τp can be fractional.
+  const xTp = snap(xOf(onsetTime(k) - P * hop)) + 0.5 / dpr;
+  ctx.strokeStyle = C.tempoGuess; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(xTp, pc.y0); ctx.lineTo(xTp, pc.y1); ctx.stroke();
+  ctx.font = CONFIG.monoFont; ctx.fillStyle = C.tempoGuess;
+  ctx.textAlign = 'left'; ctx.textBaseline = 'bottom';
+  ctx.fillText('t − τp', xTp + 4, pc.y1 - 4);
+
   ctx.strokeStyle = C.candidate; ctx.lineWidth = 1.25; ctx.setLineDash([4, 3]);
   ctx.beginPath();
   for (let tau = a; tau <= b; tau++) {
@@ -851,11 +891,123 @@ function drawSearchWindow() {
   ctx.stroke(); ctx.setLineDash([]);
   const best = back[k];
   const xBest = xOf(onsetTime(best));
+  // penalty at the winner: the drop from C*(τ*) to its candidate score
+  const yWin = cumY(cum[k] - onset[k]);
+  ctx.strokeStyle = C.penalty; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(xBest, cumY(cum[best])); ctx.lineTo(xBest, yWin); ctx.stroke();
   ctx.fillStyle = C.hoverArc;
-  ctx.beginPath(); ctx.arc(xBest, cumY(cum[k] - onset[k]), 3.5, 0, 2 * Math.PI); ctx.fill();
+  ctx.beginPath(); ctx.arc(xBest, yWin, 3.5, 0, 2 * Math.PI); ctx.fill();
   arrowArc(pc, xOf(onsetTime(k)), cumY(cum[k]), xBest, cumY(cum[best]),
            C.hoverArc, `P*(${k}) = ${best}`, C.bg);
   ctx.restore();
+}
+
+// The best beat sequence ending at the hovered frame: k, P*(k), P*(P*(k)), …
+// C*(k) is exactly its total score (Σ O over its beats − Σ transition penalties).
+let chainK = -2, chainArr = [];
+function hoverChain() {
+  const k = stage() >= 2 && !drag?.moved ? hoverFrame() : -1;
+  if (k !== chainK) {
+    chainK = k; chainArr = [];
+    for (let j = k; j >= 0; j = back[j]) chainArr.push(j);
+  }
+  return chainArr;
+}
+function drawChain() {
+  const ch = chainBox.checked ? hoverChain() : [];
+  if (ch.length < 2) return;
+  const pc = geo.p.cum, po = geo.p.onset;
+  const tL = state.t0 - hop, tR = state.t0 + visSec() + hop;
+  ctx.save();
+  ctx.beginPath(); ctx.rect(geo.L, geo.top, geo.pw, geo.bottom - geo.top); ctx.clip();
+  ctx.strokeStyle = C.chain; ctx.lineWidth = 1; ctx.setLineDash([2, 4]);
+  ctx.beginPath();
+  for (let i = 1; i < ch.length; i++) {
+    const t = onsetTime(ch[i]);
+    if (t < tL) break;
+    if (t > tR) continue;
+    const x = snap(xOf(t)) + 0.5 / dpr;
+    ctx.moveTo(x, geo.top); ctx.lineTo(x, geo.bottom);
+  }
+  ctx.stroke(); ctx.setLineDash([]);
+  ctx.fillStyle = C.chainDot;
+  ctx.beginPath();
+  for (let i = 1; i < ch.length; i++) {
+    const j = ch[i], t = onsetTime(j);
+    if (t < tL) break;
+    if (t > tR) continue;
+    const x = xOf(t);
+    if (pc) { ctx.moveTo(x + 3.5, cumY(cum[j])); ctx.arc(x, cumY(cum[j]), 3.5, 0, 2 * Math.PI); }
+    if (po) { ctx.moveTo(x + 3.5, onsetY(onset[j])); ctx.arc(x, onsetY(onset[j]), 3.5, 0, 2 * Math.PI); }
+  }
+  ctx.fill();
+  ctx.restore();
+  // Links between earlier beats (the first link, k → P*(k), is drawSearchWindow's).
+  if (!pc) return;
+  clipPanel(pc);
+  ctx.globalAlpha = CONFIG.chainArcAlpha;
+  for (let i = 1; i + 1 < ch.length; i++) {
+    const a = ch[i], b = ch[i + 1];
+    if (onsetTime(a) < tL) break;
+    if (onsetTime(b) > tR) continue;
+    arrowArc(pc, xOf(onsetTime(a)), cumY(cum[a]), xOf(onsetTime(b)), cumY(cum[b]),
+             C.chainArc, null, null, 1.25);
+  }
+  ctx.globalAlpha = 1;
+  ctx.restore();
+}
+
+// Equation card: the recurrence with the hovered frame's numbers filled in.
+const eqCard = document.getElementById('eqcard');
+const Pstr = Number.isInteger(P) ? String(P) : P.toFixed(1);
+const fmt2 = v => v.toFixed(2).replace('-', '−');
+function eqGrid(rows) {
+  const cell = ([cls, text, color]) => `<span class="${cls}"${color ? ` style="color:${color}"` : ''}>${text}</span>`;
+  return `<div class="eq" style="grid-template-columns: repeat(${rows[0].length}, auto)">`
+    + rows.map(r => r.map(cell).join('')).join('') + '</div>';
+}
+function eqHTML(k, ch) {
+  const b = back[k];
+  if (b < 0) {
+    return eqGrid([
+      [['sym', 'C*(t)'], ['sym', '='], ['sym', 'O(t)']],
+      [['num', fmt2(cum[k]), C.cum], ['op', '='], ['num', fmt2(onset[k]), C.onset]],
+      [['sub', `t = ${k}`], ['sub', ''], ['sub', '']],
+    ]) + `<div class="note">Within the first 2τ<sub>p</sub> = ${-pLo} frames there is no full search window,<br>
+      so P*(t) = −1 and C*(t) is just O(t): a beat sequence can <b>start</b> here.</div>`;
+  }
+  const gap = k - b, pen = ALPHA * Math.log(gap / P) ** 2;
+  let sumO = 0;
+  for (const j of ch) sumO += onset[j];
+  const first = ch[ch.length - 1];
+  return eqGrid([
+    [['sym', 'C*(t)'], ['sym', '='], ['sym', 'O(t)'], ['sym', '+'], ['sym', 'C*(τ*)'], ['sym', '−'],
+     ['sym', 'α·log²((t−τ*)/τ<sub>p</sub>)']],
+    [['num', fmt2(cum[k]), C.cum], ['op', '='], ['num', fmt2(onset[k]), C.onset], ['op', '+'],
+     ['num', fmt2(cum[b]), C.cum], ['op', '−'], ['num', fmt2(pen), C.penalty]],
+    [['sub', `t = ${k}`], ['sub', ''], ['sub', ''], ['sub', ''], ['sub', `τ* = P*(t) = ${b}`], ['sub', ''],
+     ['sub', `${ALPHA}·log²(${gap}/${Pstr})`]],
+  ]) + `<div class="note">τ* is the peak of the dashed curve in the shaded window.<br>
+    Best sequence ending at t: <b>${ch.length} beats</b> back to ${onsetTime(first).toFixed(2)} s (faint lines).<br>
+    C*(t) = ΣO <b>${fmt2(sumO)}</b> − Σpenalties <b>${fmt2(sumO - cum[k])}</b></div>`;
+}
+let eqK = -1;
+function updateEqCard() {
+  const ch = hoverChain(), k = ch.length ? ch[0] : -1;
+  if (k < 0 || !eqBox.checked) { eqCard.hidden = true; eqK = -1; return; }
+  if (k !== eqK) { eqK = k; eqCard.innerHTML = eqHTML(k, ch); }
+  eqCard.hidden = false;
+  // Right of the cursor in the C* panel (the search window is to the left).
+  // Near the right edge, flip left and drop into the spectrogram so it
+  // doesn't cover the window and arrows.
+  const w = eqCard.offsetWidth, h = eqCard.offsetHeight, x = state.hoverX;
+  let left = x + 18, top = geo.p.cum.y0 + 32;
+  if (left + w > geo.R - 4) {
+    left = x - 18 - w;
+    top = geo.p.spec.y0 + 8;
+  }
+  eqCard.style.left = `${clamp(left, 4, W - w - 4)}px`;
+  eqCard.style.top = `${clamp(top, 4, H - h - 4)}px`;
 }
 
 function drawCursors() {
@@ -893,6 +1045,7 @@ function drawMain() {
   if (geo.p.cum) drawCumPanel(geo.p.cum);
   if (geo.p.back) drawBackPanel(geo.p.back);
   drawGridAndAxes();
+  drawChain();
   drawSearchWindow();
   drawBeats();
   for (const p of panels) {
@@ -902,6 +1055,7 @@ function drawMain() {
     panelTitle(p, title);
   }
   drawCursors();
+  updateEqCard();
 }
 
 function drawOverview() {
@@ -932,6 +1086,11 @@ function drawOverview() {
     const x = L + onsetTime(beats[i]) / duration * pw;
     octx.fillStyle = i === cIdx ? C.beatCurrent : C.beat;
     octx.fillRect(x - (i === cIdx ? 1 : 0.5), 2, i === cIdx ? 2 : 1, 10);
+  }
+  // hovered frame's best chain, across the whole song
+  if (chainBox.checked) {
+    octx.fillStyle = C.chainOverview;
+    for (const j of hoverChain()) octx.fillRect(L + onsetTime(j) / duration * pw - 0.5, OH - 12, 1, 10);
   }
   // visible window
   const xa = L + state.t0 / duration * pw, xb = L + (state.t0 + visSec()) / duration * pw;
@@ -987,6 +1146,7 @@ function setStep(s) {
   captionEl.innerHTML = captionHTML();
   clickWrap.hidden = stage() !== 3;
   offsetWrap.hidden = stage() !== 3;
+  chainWrap.hidden = eqWrap.hidden = stage() < 2;
   resetClicks();   // the set of revealed beats changed
 
   // Keep the current beat (and the beat it points to) in view.
@@ -1142,6 +1302,19 @@ ov.addEventListener('pointerdown', e => { ov.setPointerCapture(e.pointerId); ovD
 ov.addEventListener('pointermove', e => { if (ovDrag) overviewTo(e); });
 ov.addEventListener('pointerup', () => { ovDrag = false; });
 
+// Forward-pass hover extras: "Full chain" and "Equation" checkboxes, remembered per browser.
+const chainBox = document.getElementById('show-chain'), eqBox = document.getElementById('show-eq');
+const chainWrap = document.getElementById('chain-wrap'), eqWrap = document.getElementById('eq-wrap');
+for (const [box, key, def] of [[chainBox, 'beatviz.showChain', CONFIG.showChain],
+                               [eqBox, 'beatviz.showEqCard', CONFIG.showEqCard]]) {
+  box.checked = def;
+  try { const v = localStorage.getItem(key); if (v !== null) box.checked = v === '1'; } catch (e) { /* storage blocked */ }
+  box.addEventListener('change', () => {
+    try { localStorage.setItem(key, box.checked ? '1' : '0'); } catch (e) { /* storage blocked */ }
+    box.blur(); dirty = true;
+  });
+}
+
 window.addEventListener('keydown', e => {
   if (e.target.tagName === 'SELECT' || e.target.tagName === 'INPUT' || e.metaKey || e.ctrlKey || e.altKey) return;
   switch (e.key) {
@@ -1156,6 +1329,11 @@ window.addEventListener('keydown', e => {
     case 'c': case 'C':
       if (stage() === 3) { clickBox.checked = !clickBox.checked; clickBox.dispatchEvent(new Event('change')); }
       break;
+    case 'k': case 'K': case 'e': case 'E': {
+      const box = e.key.toLowerCase() === 'k' ? chainBox : eqBox;
+      if (stage() >= 2) { box.checked = !box.checked; box.dispatchEvent(new Event('change')); }
+      break;
+    }
     case 'Home': e.preventDefault(); seek(0); tween = null; state.t0 = 0; dirty = true; break;
   }
 });
