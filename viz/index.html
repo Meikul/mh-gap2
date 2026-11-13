@@ -13,6 +13,7 @@
     --text: #e6e8ec;
     --muted: #8a93a3;
     --accent: #4fd1c5;
+    --beat: #ffb000;
     --font: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
     --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
   }
@@ -21,17 +22,36 @@
   header { padding: 18px 20px 6px; display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap; }
   header h1 { margin: 0; font-size: 20px; font-weight: 600; }
   header .sub { color: var(--muted); font-size: 13px; }
-  #toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 8px 20px 12px; }
-  #toolbar .spacer { flex: 1; }
+  .bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 8px 20px; }
+  .bar .spacer { flex: 1; }
   button, select {
     font: inherit; color: var(--text); background: var(--surface);
     border: 1px solid var(--border); border-radius: 6px; padding: 5px 12px; cursor: pointer;
   }
-  button:hover, select:hover { border-color: var(--muted); }
+  button:hover:not(:disabled), select:hover { border-color: var(--muted); }
+  button:disabled { opacity: 0.4; cursor: default; }
   #play { min-width: 92px; }
   #clock, #zoom-label { font-family: var(--mono); font-size: 13px; color: var(--muted); }
   label { color: var(--muted); display: inline-flex; align-items: center; gap: 6px; }
-  #view, #overview-wrap { padding: 0 0; }
+
+  /* Stage stepper */
+  #stages { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  #stages button { border: 0; border-radius: 0; border-right: 1px solid var(--border); background: transparent; color: var(--muted); padding: 6px 14px; }
+  #stages button:last-child { border-right: 0; }
+  #stages button.active { background: var(--surface); color: var(--text); box-shadow: inset 0 -2px 0 var(--accent); }
+  #stages button.done { color: var(--text); }
+  #stages .num { font-family: var(--mono); opacity: 0.6; margin-right: 6px; }
+  #next { border-color: var(--accent); }
+  #step-count { font-family: var(--mono); font-size: 13px; color: var(--muted); }
+  #caption {
+    margin: 4px 20px 10px; padding: 10px 14px; min-height: 64px;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+    font-size: 14px; line-height: 1.55;
+  }
+  #caption b { font-weight: 600; }
+  #caption .math { font-family: var(--mono); font-size: 13px; color: var(--text); white-space: nowrap; }
+  #caption .beat { color: var(--beat); font-weight: 600; }
+
   canvas { display: block; touch-action: none; }
   #main { cursor: crosshair; }
   #main.dragging { cursor: grabbing; }
@@ -48,16 +68,31 @@
 <header>
   <h1 id="title">Beat tracking</h1>
   <span class="sub">Ellis (2007), Beat Tracking by Dynamic Programming</span>
+  <span class="spacer" style="flex:1"></span>
+  <label>Song <select id="song"></select></label>
 </header>
 
 <div id="missing" hidden>
-  No data found. From the project root run
-  <code>python export_viz.py "audio/Party 20s.mp3"</code>
+  <span id="missing-msg">No songs exported yet.</span> From the project root run
+  <code>python export_viz.py path/to/audio.mp3</code>
   and reload this page.
 </div>
 
 <div id="app">
-  <div id="toolbar">
+  <div class="bar" id="stagebar">
+    <div id="stages">
+      <button data-stage="0"><span class="num">1</span>Spectrogram</button>
+      <button data-stage="1"><span class="num">2</span>Onset envelope</button>
+      <button data-stage="2"><span class="num">3</span>Forward pass</button>
+      <button data-stage="3"><span class="num">4</span>Backtrace</button>
+    </div>
+    <button id="prev" title="Previous step (← / PageUp)">◀ Back</button>
+    <button id="next" title="Next step (→ / PageDown)">Next ▶</button>
+    <button id="skip" title="Show every beat (End)">Skip to end ⏭</button>
+    <span id="step-count"></span>
+  </div>
+  <div id="caption"></div>
+  <div class="bar" id="toolbar">
     <button id="play" title="Play / pause (Space)">▶ Play</button>
     <span id="clock">0:00.000 / 0:00.000</span>
     <label>Speed
@@ -79,12 +114,14 @@
   <div id="overview-wrap"><canvas id="overview"></canvas></div>
   <div id="status">
     <span id="hover-info">&nbsp;</span>
-    <span>drag / scroll: pan · ⌘/Ctrl + scroll or pinch: zoom · click: seek · Space: play</span>
+    <span>drag / scroll: pan · ⌘/Ctrl + scroll or pinch: zoom · click: seek · Space: play · ←/→: step</span>
   </div>
 </div>
 
 <audio id="audio" preload="auto"></audio>
-<script src="data.js"></script>
+<!-- songs.js lists the exported songs (written by export_viz.py); each song's
+     data lives in <id>/data.js and is loaded below for the chosen ?song=<id>. -->
+<script src="songs.js"></script>
 <script>
 // ============================================================================
 // CONFIG: everything that controls the look. Edit and reload.
@@ -95,27 +132,33 @@ const CONFIG = {
   specDbRange: 50,          // show this many dB below the loudest bin; quieter is the darkest colour
   specGamma: 1.0,           // <1 brightens quiet detail, >1 emphasises loud parts
 
-  // Layout (CSS px)
-  layout: { left: 72, right: 20, top: 8, onsetH: 170, gap: 10, specH: 300, axisH: 30 },
+  // Layout (CSS px). Panels stack top to bottom: C*, P*, O(t), spectrogram.
+  // Panels only take up space once their stage has been reached.
+  layout: { left: 72, right: 20, top: 8, cumH: 150, backH: 64, onsetH: 150, gap: 10, specH: 260, axisH: 30 },
   overviewH: 48,
 
-  // Onset envelope
+  // Line plots
   onsetLineWidth: 1.5,
+  cumLineWidth: 1.5,
   onsetYMax: null,          // null = auto (envelope max); a number clips taller peaks
+  cumSmoothScale: true,     // C* y-axis rescales to the visible range; ease the change
   showPointsAtPxPerFrame: 6,  // draw a dot per frame when zoomed in this far
   frameGridAtPxPerFrame: 8,   // draw frame boundaries when zoomed in this far
+  backlinkNumbersAtPxPerFrame: 13,  // show P*(t) as numbers (else as the gap t − P*(t))
 
   // Zoom / view
   initialViewSec: 8,        // seconds visible on load
   maxPxPerFrame: 60,        // zoom-in limit
   minTickPx: 80,            // minimum spacing between time-axis labels
   followAt: 0.3,            // playhead position (fraction of width) while following
+  backtraceBeatAt: 0.75,    // where the current beat sits after an auto-pan in the backtrace
 
   // Shift the drawn playhead to compensate for output latency (e.g. Bluetooth/HDMI)
   audioLatencyMs: 0,
 
   font: '12px ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif',
   titleFont: '600 12px ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif',
+  monoFont: '10.5px ui-monospace, "SF Mono", Menlo, Consolas, monospace',
 
   colors: {
     bg: '#0f1115',
@@ -127,7 +170,19 @@ const CONFIG = {
     muted: '#7d8696',
     onset: '#4fd1c5',
     onsetFill: 'rgba(79,209,197,0.16)',
+    cum: '#a78bfa',
+    cumFill: 'rgba(167,139,250,0.10)',
+    backline: '#93c5fd',
+    cellAlt: 'rgba(255,255,255,0.035)',
     zero: 'rgba(255,255,255,0.28)',
+    beat: 'rgba(255,176,0,0.85)',
+    beatBg: 'rgba(255,176,0,0.22)',
+    beatCurrent: '#ffe066',
+    beatCurrentBg: 'rgba(255,224,102,0.85)',
+    beatCurrentText: '#16130a',
+    window: 'rgba(147,197,253,0.10)',
+    candidate: 'rgba(255,255,255,0.6)',
+    hoverArc: '#ffffff',
     playhead: '#ff4d6d',
     hover: 'rgba(255,255,255,0.45)',
     titleBg: 'rgba(15,17,21,0.72)',
@@ -136,13 +191,65 @@ const CONFIG = {
   },
 };
 
+// Stage captions (HTML). `v` holds live values; edit the wording freely.
+const CAPTIONS = {
+  spec: v => `<b>1 · Mel spectrogram.</b> The audio is resampled to 8 kHz and cut into
+    32 ms windows every 4 ms (${v.fr} frames/s). Each window's spectrum is summed into
+    ${v.M} Mel bands and converted to dB.`,
+  onset: v => `<b>2 · Onset strength envelope O(t).</b> For each band, take the increase in
+    dB from one frame to the next, discard decreases, and sum across bands. Then high-pass
+    (0.4 Hz), smooth (≈20 ms Gaussian) and scale to unit standard deviation.
+    This is the <i>local score</i> the dynamic program tries to land beats on.`,
+  forward: v => `<b>3 · Forward pass.</b> Tempo estimate τ<sub>p</sub> = ${v.P} frames
+    (${v.bpm} BPM). Left to right, for every frame t:
+    <span class="math">C*(t) = O(t) + max<sub>τ∈[t−${v.w0}, t−${v.w1}]</sub> { C*(τ) − ${v.alpha}·log²((t−τ)/τ<sub>p</sub>) }</span>,
+    and <span class="math">P*(t)</span> records the winning τ.
+    <i>Hover a frame</i> to see its search window, the candidate scores (dashed) and the chosen predecessor.`,
+  backtrace: v => v.prev >= 0
+    ? `<b>4 · Backtrace</b>: step ${v.n} of ${v.B}. ${v.n === 1
+        ? `Start at the frame with the <b>highest cumulative score</b>: `
+        : `Follow the backlink to `}
+      <span class="beat">frame ${v.k}</span> (${v.t} s, C* = ${v.c}).
+      Its backlink <span class="math">P*(${v.k}) = ${v.prev}</span> is the previous beat, ${v.gap} frames earlier.`
+    : `<b>4 · Backtrace</b>: step ${v.n} of ${v.B}. <span class="beat">Frame ${v.k}</span> (${v.t} s) has
+      <span class="math">P*(${v.k}) = −1</span>: no predecessor, so the backtrace stops.`,
+  done: v => `<b>4 · Backtrace complete.</b> ${v.B} beats from ${v.first} s to ${v.last} s.
+    Mean spacing ${v.meanGap} frames (${v.meanSec} s ≈ ${v.meanBpm} BPM) vs. target τ<sub>p</sub> = ${v.P} frames.`,
+};
+
+function showMissing(msg) {
+  if (msg) document.getElementById('missing-msg').textContent = msg;
+  document.getElementById('missing').hidden = false;
+  document.getElementById('app').hidden = true;
+}
+
+// Pick the song from ?song=<id> (default: first exported), fill the picker,
+// then load <id>/data.js with a <script> tag (works from file://, unlike fetch).
 (() => {
+  const songs = window.VIZ_SONGS || [];
+  if (!songs.length) { showMissing(); return; }
+  const want = new URLSearchParams(location.search).get('song');
+  const song = songs.find(s => s.id === want) || songs[0];
+  const picker = document.getElementById('song');
+  for (const s of songs) picker.add(new Option(s.title, s.id, false, s.id === song.id));
+  picker.addEventListener('change', () => {
+    const q = new URLSearchParams(location.search);
+    q.set('song', picker.value);
+    location.search = q.toString();
+  });
+  const tag = document.createElement('script');
+  tag.src = `${encodeURIComponent(song.id)}/data.js`;
+  tag.onload = () => startViewer(song.id);
+  tag.onerror = () => showMissing(`Could not load ${song.id}/data.js.`);
+  document.body.appendChild(tag);
+})();
+
+function startViewer(songId) {
 'use strict';
 
 const D = window.VIZ_DATA;
-if (!D) {
-  document.getElementById('missing').hidden = false;
-  document.getElementById('app').hidden = true;
+if (!D || !D.cumscore) {
+  showMissing(`${songId}/data.js is from an older export (no forward-pass data); re-run export_viz.py.`);
   return;
 }
 
@@ -157,9 +264,18 @@ function b64ToBytes(s) {
 const C = CONFIG.colors, LY = CONFIG.layout;
 const fr = D.frameRate, hop = 1 / fr, half = D.winSec / 2;
 const T = D.nFrames, M = D.nMels, duration = D.duration;
-const mel = b64ToBytes(D.melDb.data);                        // T*M, frame-major
-const onset = new Float32Array(b64ToBytes(D.onset).buffer);  // T-1
+const mel = b64ToBytes(D.melDb.data);                          // T*M, frame-major
+const onset = new Float32Array(b64ToBytes(D.onset).buffer);    // NO = T-1 frames
+const cum = new Float32Array(b64ToBytes(D.cumscore).buffer);   // C*(t)
+const back = new Int32Array(b64ToBytes(D.backlink).buffer);    // P*(t), -1 = none
 const NO = onset.length;
+const beats = D.beats, B = beats.length;                       // ascending frames
+const P = D.tempo.period, ALPHA = D.alpha;
+const [pLo, pHi] = D.prange;          // search window: tau in [t + pLo, t + pHi]
+const gapArr = new Float32Array(NO);  // t - P*(t), for the zoomed-out backlink plot
+for (let k = 0; k < NO; k++) gapArr[k] = back[k] >= 0 ? k - back[k] : NaN;
+const beatRank = new Int32Array(NO).fill(-1);
+beats.forEach((k, i) => { beatRank[k] = i; });
 
 // Time conventions (match beat_analysis.frames_to_time):
 //   STFT column j is centred at j*hop + win/2
@@ -176,6 +292,21 @@ const oHi = CONFIG.onsetYMax ?? oMax * 1.05;
 
 document.getElementById('title').textContent = D.title;
 document.title = 'Beats: ' + D.title;
+
+// ----------------------------------------------------------------------------
+// Steps. 0 spectrogram · 1 onset · 2 forward pass · 3..2+B backtrace with
+// 1..B beats revealed (latest one "current") · LAST = all beats, no current.
+// ----------------------------------------------------------------------------
+const STEP_BT = 3, LAST = STEP_BT + B;
+const stageOf = s => Math.min(s, 3);
+const shownOf = s => s < STEP_BT ? 0 : Math.min(B, s - STEP_BT + 1);
+const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+const state = { step: 0, t0: 0, pps: NaN, follow: true, hoverX: null, hoverY: null };
+const stage = () => stageOf(state.step);
+const nShown = () => shownOf(state.step);
+// asc index of the current (most recently revealed) beat, or -1
+const curIdx = () => (state.step >= STEP_BT && state.step < LAST) ? B - nShown() : -1;
+const revealed = k => beatRank[k] >= 0 && beatRank[k] >= B - nShown();
 
 // ----------------------------------------------------------------------------
 // Colormap -> 256-entry LUT indexed by the quantised dB byte
@@ -210,7 +341,6 @@ function colormap(t) {
   }
   return rgb;
 }
-const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 const LUT = new Uint8Array(256 * 4);
 {
   const dbMin = D.melDb.min, dbMax = D.melDb.max, range = CONFIG.specDbRange;
@@ -272,9 +402,14 @@ const cv = document.getElementById('main'), ctx = cv.getContext('2d');
 const ov = document.getElementById('overview'), octx = ov.getContext('2d');
 const followBox = document.getElementById('follow');
 
-const state = { t0: 0, pps: NaN, follow: true, hoverX: null, hoverY: null };
-const geo = {};
-let W = 0, H = 0, dpr = 1, minPps = 1, dirty = true;
+const PANELS = [   // top to bottom; `stage` = first stage that shows it
+  { id: 'cum', stage: 2, h: 'cumH', title: 'Cumulative score  C*(t)' },
+  { id: 'back', stage: 2, h: 'backH', title: 'Backlink  P*(t)' },
+  { id: 'onset', stage: 1, h: 'onsetH', title: 'Onset strength envelope  O(t)' },
+  { id: 'spec', stage: 0, h: 'specH', title: `Mel spectrogram  ·  ${M} bands  ·  dB` },
+];
+const geo = { p: {} };
+let W = 0, H = 0, dpr = 1, minPps = 1, dirty = true, tween = null;
 const maxPps = CONFIG.maxPxPerFrame * fr;
 
 function sizeCanvas(c, w, h) {
@@ -285,10 +420,17 @@ function layout() {
   dpr = window.devicePixelRatio || 1;
   W = viewEl.clientWidth;
   geo.L = LY.left; geo.R = W - LY.right; geo.pw = geo.R - geo.L;
-  geo.oy0 = LY.top; geo.oy1 = geo.oy0 + LY.onsetH;
-  geo.sy0 = geo.oy1 + LY.gap; geo.sy1 = geo.sy0 + LY.specH;
-  geo.ay1 = geo.sy1 + LY.axisH;
-  H = geo.ay1;
+  let y = LY.top;
+  geo.top = null;
+  for (const p of PANELS) {
+    if (stage() < p.stage) { geo.p[p.id] = null; continue; }
+    const h = LY[p.h];
+    geo.p[p.id] = { y0: y, y1: y + h, h, title: p.title };
+    if (geo.top === null) geo.top = y;
+    y += h + LY.gap;
+  }
+  geo.bottom = geo.p.spec.y1;
+  H = geo.bottom + LY.axisH;
   sizeCanvas(cv, W, H);
   sizeCanvas(ov, W, CONFIG.overviewH);
   minPps = geo.pw / duration;
@@ -302,6 +444,16 @@ const xOf = t => geo.L + (t - state.t0) * state.pps;
 const tOf = x => state.t0 + (x - geo.L) / state.pps;
 const snap = x => Math.round(x * dpr) / dpr;
 function clampView() { state.t0 = clamp(state.t0, 0, Math.max(0, duration - visSec())); }
+function visFrames(pad = 2) {
+  return [clamp(onsetFrameAt(state.t0) - pad, 0, NO - 1),
+          clamp(onsetFrameAt(state.t0 + visSec()) + pad, 0, NO - 1)];
+}
+function panTo(t0) {
+  const to = clamp(t0, 0, Math.max(0, duration - visSec()));
+  if (Math.abs(to - state.t0) * state.pps < 1) return;
+  tween = { from: state.t0, to, start: performance.now(), dur: 380 };
+  dirty = true;
+}
 
 // ----------------------------------------------------------------------------
 // Playback clock (interpolated between the browser's currentTime updates)
@@ -317,13 +469,19 @@ function playTime() {
 const displayTime = () => playTime() - (audio.paused ? 0 : CONFIG.audioLatencyMs / 1000);
 
 // ----------------------------------------------------------------------------
-// Drawing
+// Drawing helpers
 // ----------------------------------------------------------------------------
 const TIME_STEPS = [0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.25, 0.5, 1, 2, 5, 10, 15, 30, 60, 120];
 function timeStep() {
   for (const s of TIME_STEPS) if (s * state.pps >= CONFIG.minTickPx) return s;
   return 300;
 }
+function niceStep(range, target) {
+  const raw = range / target, p10 = Math.pow(10, Math.floor(Math.log10(raw)));
+  for (const m of [1, 2, 2.5, 5, 10]) if (m * p10 >= raw) return m * p10;
+  return 10 * p10;
+}
+const fmtNum = (v, step) => v.toFixed(Math.max(0, Math.ceil(-Math.log10(step) - 1e-9)));
 function fmtTime(t, dec) {
   const m = Math.floor(t / 60), s = t - 60 * m;
   return m > 0 ? `${m}:${s.toFixed(dec).padStart(dec ? dec + 3 : 2, '0')}` : `${s.toFixed(dec)} s`;
@@ -333,101 +491,213 @@ function fmtClock(t) {
   return `${m}:${s.toFixed(3).padStart(6, '0')}`;
 }
 const hzToMel = f => 2595 * Math.log10(1 + f / 700);
-const onsetY = v => geo.oy1 - (v - oLo) / (oHi - oLo) * (geo.oy1 - geo.oy0);
 
-function panelTitle(text, y) {
+// y mappings per panel
+const onsetY = v => { const p = geo.p.onset; return p.y1 - (v - oLo) / (oHi - oLo) * p.h; };
+const cumView = { lo: NaN, hi: NaN };
+const cumY = v => { const p = geo.p.cum; return p.y1 - 6 - (v - cumView.lo) / (cumView.hi - cumView.lo) * (p.h - 36); };
+const gapY = g => { const p = geo.p.back; return p.y1 - 6 - (g + pHi) / (pHi - pLo) * (p.h - 34); };
+
+function clipPanel(p) { ctx.save(); ctx.beginPath(); ctx.rect(geo.L, p.y0, geo.pw, p.h); ctx.clip(); }
+
+function panelTitle(p, text) {
   ctx.font = CONFIG.titleFont;
   const w = ctx.measureText(text).width;
   ctx.fillStyle = C.titleBg;
-  ctx.fillRect(geo.L + 6, y + 6, w + 12, 20);
+  ctx.fillRect(geo.L + 6, p.y0 + 6, w + 12, 20);
   ctx.fillStyle = C.text;
   ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
-  ctx.fillText(text, geo.L + 12, y + 16);
+  ctx.fillText(text, geo.L + 12, p.y0 + 16);
+}
+function sideLabel(p, text) {
+  ctx.save();
+  ctx.font = CONFIG.font; ctx.fillStyle = C.muted;
+  ctx.translate(14, (p.y0 + p.y1) / 2); ctx.rotate(-Math.PI / 2);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText(text, 0, 0);
+  ctx.restore();
 }
 
-function drawSpectrogram() {
-  const { L, pw, sy0 } = geo, specH = LY.specH;
-  const ppf = state.pps * hop;
+// Draw the spectrogram into context g, mapping time t to x0 + (t - tStart) * pps.
+function drawSpecInto(g, x0, x1, tStart, pps, y0, h) {
+  const ppf = pps * hop;
   const l = ppf >= 1 ? 0 : Math.ceil(Math.log2(1 / ppf));
   const lv = getLevel(l), colSec = (1 << l) * hop;
-  const edge0 = half - hop / 2;                   // left edge of column 0
-  const t1 = state.t0 + visSec();
-  const c0 = Math.max(0, Math.floor((state.t0 - edge0) / colSec));
-  const c1 = Math.min(lv.n - 1, Math.ceil((t1 - edge0) / colSec));
-  ctx.save();
-  ctx.beginPath(); ctx.rect(L, sy0, pw, specH); ctx.clip();
-  ctx.imageSmoothingEnabled = false;
+  const edge0 = half - hop / 2;                     // left edge of column 0
+  const tEnd = tStart + (x1 - x0) / pps;
+  const X = t => snap(x0 + (t - tStart) * pps);
+  const c0 = Math.max(0, Math.floor((tStart - edge0) / colSec));
+  const c1 = Math.min(lv.n - 1, Math.ceil((tEnd - edge0) / colSec));
+  g.save();
+  g.beginPath(); g.rect(x0, y0, x1 - x0, h); g.clip();
+  g.imageSmoothingEnabled = false;
   for (let ti = Math.floor(c0 / TILE); ti <= Math.floor(c1 / TILE); ti++) {
     const tile = getTile(lv, ti), cs = ti * TILE;
     const a = Math.max(c0, cs), b = Math.min(c1 + 1, cs + tile.width);   // [a, b) columns
     if (b <= a) continue;
-    const xa = snap(xOf(edge0 + a * colSec)), xb = snap(xOf(edge0 + b * colSec));
-    ctx.drawImage(tile, a - cs, 0, b - a, M, xa, sy0, xb - xa, specH);
+    const xa = X(edge0 + a * colSec), xb = X(edge0 + b * colSec);
+    g.drawImage(tile, a - cs, 0, b - a, M, xa, y0, xb - xa, h);
   }
-  ctx.restore();
+  g.restore();
 }
 
-function drawOnset() {
-  const { L, R, pw, oy0 } = geo;
-  const ppf = state.pps * hop, t1 = state.t0 + visSec();
-  const kA = clamp(onsetFrameAt(state.t0) - 2, 0, NO - 1);
-  const kB = clamp(onsetFrameAt(t1) + 2, 0, NO - 1);
-  const y0 = onsetY(0);
-  ctx.save();
-  ctx.beginPath(); ctx.rect(L, oy0, pw, LY.onsetH); ctx.clip();
-
-  // zero line
-  ctx.strokeStyle = C.zero; ctx.lineWidth = 1;
-  ctx.beginPath(); ctx.moveTo(L, snap(y0) + 0.5 / dpr); ctx.lineTo(R, snap(y0) + 0.5 / dpr); ctx.stroke();
-
+// Line plot of a per-onset-frame array. Zoomed out it draws per-pixel min/max
+// so no peak is skipped. NaN values are left as gaps.
+function drawSeries(arr, p, yOf, o) {
+  const { L, R } = geo, ppf = state.pps * hop;
+  const [kA, kB] = visFrames();
+  clipPanel(p);
   if (ppf >= 1) {
     const trace = () => {
       ctx.beginPath();
+      let pen = false;
       for (let k = kA; k <= kB; k++) {
-        const x = xOf(onsetTime(k)), y = onsetY(onset[k]);
-        k === kA ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+        const v = arr[k];
+        if (v !== v) { pen = false; continue; }
+        const x = xOf(onsetTime(k)), y = yOf(v);
+        pen ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+        pen = true;
       }
     };
+    if (o.fill) {
+      trace();
+      ctx.lineTo(xOf(onsetTime(kB)), o.base); ctx.lineTo(xOf(onsetTime(kA)), o.base); ctx.closePath();
+      ctx.fillStyle = o.fill; ctx.fill();
+    }
     trace();
-    ctx.lineTo(xOf(onsetTime(kB)), y0); ctx.lineTo(xOf(onsetTime(kA)), y0); ctx.closePath();
-    ctx.fillStyle = C.onsetFill; ctx.fill();
-    trace();
-    ctx.strokeStyle = C.onset; ctx.lineWidth = CONFIG.onsetLineWidth; ctx.lineJoin = 'round';
+    ctx.strokeStyle = o.color; ctx.lineWidth = o.lw; ctx.lineJoin = 'round';
     ctx.stroke();
-    if (ppf >= CONFIG.showPointsAtPxPerFrame) {
-      ctx.fillStyle = C.onset;
+    if (ppf >= CONFIG.showPointsAtPxPerFrame && o.points !== false) {
+      ctx.fillStyle = o.color;
       const r = Math.min(3.5, 1 + ppf / 12);
       ctx.beginPath();
       for (let k = kA; k <= kB; k++) {
-        const x = xOf(onsetTime(k)), y = onsetY(onset[k]);
+        if (arr[k] !== arr[k]) continue;
+        const x = xOf(onsetTime(k)), y = yOf(arr[k]);
         ctx.moveTo(x + r, y); ctx.arc(x, y, r, 0, 2 * Math.PI);
       }
       ctx.fill();
     }
   } else {
-    // Zoomed out: per-pixel min/max so no peak is ever skipped.
     let k = kA;
-    const step = 1 / dpr;
-    while (k <= kB && onsetTime(k) < tOf(L)) k++;
+    const step = 1 / dpr, tL = tOf(L);
+    while (k <= kB && onsetTime(k) < tL) k++;
     for (let x = L; x < R; x += step) {
       const tb = tOf(x + step);
       let lo = Infinity, hi = -Infinity;
-      while (k <= kB && onsetTime(k) < tb) { const v = onset[k++]; if (v < lo) lo = v; if (v > hi) hi = v; }
+      while (k <= kB && onsetTime(k) < tb) { const v = arr[k++]; if (v < lo) lo = v; if (v > hi) hi = v; }
       if (hi === -Infinity) continue;
-      const yh = onsetY(hi), yl = onsetY(lo);
-      ctx.fillStyle = C.onsetFill;
-      ctx.fillRect(x, Math.min(yh, y0), step, Math.abs(Math.max(yl, y0) - Math.min(yh, y0)));
-      ctx.fillStyle = C.onset;
-      ctx.fillRect(x, yh, step, Math.max(CONFIG.onsetLineWidth, yl - yh));
+      const yh = yOf(hi), yl = yOf(lo);
+      if (o.fill) {
+        const a = Math.min(yh, o.base), b = Math.max(yl, o.base);
+        ctx.fillStyle = o.fill; ctx.fillRect(x, a, step, b - a);
+      }
+      ctx.fillStyle = o.color;
+      ctx.fillRect(x, yh, step, Math.max(o.lw, yl - yh));
     }
   }
   ctx.restore();
 }
 
+// Curved arrow from (x1,y1) to (x2,y2), bowing upward, with a label at its apex.
+function arrowArc(p, x1, y1, x2, y2, color, label, labelColor) {
+  const lift = Math.max(26, Math.abs(x2 - x1) * 0.28);
+  const cx = (x1 + x2) / 2, cy = Math.max(p.y0 + 4, Math.min(y1, y2) - lift);
+  ctx.strokeStyle = color; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.quadraticCurveTo(cx, cy, x2, y2); ctx.stroke();
+  const ang = Math.atan2(y2 - cy, x2 - cx), s = 9;
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.moveTo(x2, y2);
+  ctx.lineTo(x2 - s * Math.cos(ang - 0.4), y2 - s * Math.sin(ang - 0.4));
+  ctx.lineTo(x2 - s * Math.cos(ang + 0.4), y2 - s * Math.sin(ang + 0.4));
+  ctx.closePath(); ctx.fill();
+  if (label) {
+    const mx = 0.25 * x1 + 0.5 * cx + 0.25 * x2, my = 0.25 * y1 + 0.5 * cy + 0.25 * y2;
+    ctx.font = CONFIG.titleFont;
+    const w = ctx.measureText(label).width + 12;
+    // At the arc's apex, or beside the start point if the target is off-screen.
+    let lx = x2 < geo.L ? x1 - w - 10 : x2 > geo.R ? x1 + 10 : mx - w / 2;
+    let ly = x2 < geo.L || x2 > geo.R ? y1 - 30 : my - 22;
+    lx = clamp(lx, geo.L + 2, geo.R - w - 2);
+    ly = Math.max(p.y0 + 2, ly);
+    // keep clear of the panel title in the top-left corner
+    ctx.font = CONFIG.titleFont;
+    const titleRight = geo.L + 18 + ctx.measureText(p.title).width;
+    if (lx < titleRight && ly < p.y0 + 28) ly = p.y0 + 30;
+    ctx.fillStyle = color; ctx.fillRect(lx, ly, w, 18);
+    ctx.fillStyle = labelColor; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+    ctx.fillText(label, lx + 6, ly + 9);
+  }
+}
+
+// ----------------------------------------------------------------------------
+// Panels
+// ----------------------------------------------------------------------------
+function drawOnsetPanel(p) {
+  clipPanel(p);
+  const y0 = snap(onsetY(0)) + 0.5 / dpr;
+  ctx.strokeStyle = C.zero; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(geo.L, y0); ctx.lineTo(geo.R, y0); ctx.stroke();
+  ctx.restore();
+  drawSeries(onset, p, onsetY, { color: C.onset, fill: C.onsetFill, base: onsetY(0), lw: CONFIG.onsetLineWidth });
+}
+
+function updateCumRange() {
+  const [kA, kB] = visFrames(0);
+  let lo = Infinity, hi = -Infinity;
+  for (let k = kA; k <= kB; k++) { const v = cum[k]; if (v < lo) lo = v; if (v > hi) hi = v; }
+  if (!(hi > lo)) hi = lo + 1;
+  const pad = (hi - lo) * 0.04; lo -= pad; hi += pad;
+  if (!CONFIG.cumSmoothScale || cumView.lo !== cumView.lo) { cumView.lo = lo; cumView.hi = hi; return; }
+  cumView.lo += (lo - cumView.lo) * 0.25;
+  cumView.hi += (hi - cumView.hi) * 0.25;
+  if (Math.abs(lo - cumView.lo) + Math.abs(hi - cumView.hi) > (hi - lo) * 0.002) dirty = true;
+  else { cumView.lo = lo; cumView.hi = hi; }
+}
+
+function drawCumPanel(p) {
+  updateCumRange();
+  drawSeries(cum, p, cumY, { color: C.cum, fill: C.cumFill, base: p.y1, lw: CONFIG.cumLineWidth });
+}
+
+function drawBackPanel(p) {
+  const ppf = state.pps * hop;
+  if (ppf >= CONFIG.backlinkNumbersAtPxPerFrame) {
+    const [kA, kB] = visFrames(1), cur = curIdx() >= 0 ? beats[curIdx()] : -1;
+    const hk = hoverFrame();
+    const yMid = (p.y0 + 26 + p.y1) / 2;
+    clipPanel(p);
+    ctx.font = CONFIG.monoFont; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    for (let k = kA; k <= kB; k++) {
+      const x0 = xOf(onsetTime(k) - hop / 2);
+      const bg = k === cur ? C.beatCurrentBg : revealed(k) ? C.beatBg
+               : k === hk ? 'rgba(255,255,255,0.12)' : (k & 1) ? C.cellAlt : null;
+      if (bg) { ctx.fillStyle = bg; ctx.fillRect(x0, p.y0, ppf, p.h); }
+      ctx.fillStyle = k === cur ? C.beatCurrentText : back[k] < 0 ? C.muted : C.text;
+      ctx.save();
+      ctx.translate(x0 + ppf / 2, yMid); ctx.rotate(-Math.PI / 2);
+      ctx.fillText(back[k] < 0 ? '−1' : String(back[k]), 0, 0);
+      ctx.restore();
+    }
+    ctx.restore();
+  } else {
+    // Zoomed out: plot the gap t − P*(t) (in frames) against the tempo target.
+    clipPanel(p);
+    const yr = snap(gapY(P)) + 0.5 / dpr;
+    ctx.strokeStyle = C.zero; ctx.lineWidth = 1; ctx.setLineDash([4, 4]);
+    ctx.beginPath(); ctx.moveTo(geo.L, yr); ctx.lineTo(geo.R, yr); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.restore();
+    drawSeries(gapArr, p, gapY, { color: C.backline, lw: 1.25, points: false });
+  }
+}
+
 function drawGridAndAxes() {
-  const { L, R, oy0, oy1, sy0, sy1, ay1 } = geo;
+  const { L, R } = geo;
   const step = timeStep(), t1 = state.t0 + visSec();
   const dec = Math.max(0, Math.ceil(-Math.log10(step) - 1e-9));
+  const panels = PANELS.map(p => geo.p[p.id]).filter(Boolean);
   ctx.font = CONFIG.font;
 
   // vertical time grid + labels
@@ -436,92 +706,179 @@ function drawGridAndAxes() {
   ctx.beginPath();
   for (let t = Math.ceil(state.t0 / step) * step; t <= t1 + 1e-9; t += step) {
     const x = snap(xOf(t)) + 0.5 / dpr;
-    ctx.moveTo(x, oy0); ctx.lineTo(x, oy1);
-    ctx.moveTo(x, sy0); ctx.lineTo(x, sy1 + 4);
-    ctx.fillText(fmtTime(t, dec), x, sy1 + 8);
+    for (const p of panels) { ctx.moveTo(x, p.y0); ctx.lineTo(x, p.y1); }
+    ctx.moveTo(x, geo.bottom); ctx.lineTo(x, geo.bottom + 4);
+    ctx.fillText(fmtTime(t, dec), x, geo.bottom + 8);
   }
   ctx.stroke();
 
   // frame boundaries when zoomed in
-  const ppf = state.pps * hop;
-  if (ppf >= CONFIG.frameGridAtPxPerFrame) {
+  if (state.pps * hop >= CONFIG.frameGridAtPxPerFrame) {
     ctx.strokeStyle = C.frameGrid;
     ctx.beginPath();
     for (let j = specColAt(state.t0); j <= specColAt(t1) + 1; j++) {
       const x = snap(xOf(specTime(j) - hop / 2)) + 0.5 / dpr;
-      ctx.moveTo(x, oy0); ctx.lineTo(x, oy1);
-      ctx.moveTo(x, sy0); ctx.lineTo(x, sy1);
+      for (const p of panels) { ctx.moveTo(x, p.y0); ctx.lineTo(x, p.y1); }
     }
     ctx.stroke();
   }
 
-  // onset y-axis
   ctx.textAlign = 'right'; ctx.textBaseline = 'middle'; ctx.fillStyle = C.muted;
-  const ys = [0.5, 1, 2, 5, 10, 20].find(s => (oHi - oLo) / s <= 6) ?? 50;
-  for (let v = Math.ceil(oLo / ys) * ys; v <= oHi; v += ys) {
-    const y = onsetY(v);
-    if (y < oy0 + 6 || y > oy1 - 2) continue;
-    ctx.fillText(Number(v.toFixed(2)).toString(), L - 8, y);
+  const tickLabels = (p, lo, hi, yOf, target) => {
+    const st = niceStep(hi - lo, target);
+    for (let v = Math.ceil(lo / st) * st; v <= hi; v += st) {
+      const y = yOf(v);
+      if (y < p.y0 + 6 || y > p.y1 - 4) continue;
+      ctx.fillText(fmtNum(v, st), L - 8, y);
+    }
+  };
+
+  // onset y-axis
+  const po = geo.p.onset;
+  if (po) { tickLabels(po, oLo, oHi, onsetY, 4); sideLabel(po, 'O(t)'); }
+
+  // C* y-axis (auto-scaled to the visible range)
+  const pc = geo.p.cum;
+  if (pc) { tickLabels(pc, cumView.lo, cumView.hi, cumY, 3); sideLabel(pc, 'C*(t)'); }
+
+  // backlink axis
+  const pb = geo.p.back;
+  if (pb) {
+    if (state.pps * hop < CONFIG.backlinkNumbersAtPxPerFrame) {
+      ctx.fillText(`τp ${Math.round(P)}`, L - 8, gapY(P));
+      sideLabel(pb, 't − P*');
+    } else sideLabel(pb, 'P*(t)');
   }
 
   // spectrogram frequency axis (mel-spaced bands)
+  const ps = geo.p.spec;
   const melStep = hzToMel(D.melMaxHz) / (M + 1);   // band b centred at (b+1)*melStep
   for (const f of [100, 250, 500, 1000, 2000, 3500]) {
     const idx = hzToMel(f) / melStep - 1;
-    const y = sy1 - (idx + 0.5) / M * LY.specH;
-    if (y < sy0 + 4 || y > sy1 - 4) continue;
+    const y = ps.y1 - (idx + 0.5) / M * ps.h;
+    if (y < ps.y0 + 4 || y > ps.y1 - 4) continue;
     ctx.fillText(f >= 1000 ? `${f / 1000}k` : `${f}`, L - 8, y);
   }
-  ctx.save();
-  ctx.translate(14, (sy0 + sy1) / 2); ctx.rotate(-Math.PI / 2);
-  ctx.textAlign = 'center'; ctx.fillText('Hz', 0, 0);
-  ctx.restore();
-  ctx.save();
-  ctx.translate(14, (oy0 + oy1) / 2); ctx.rotate(-Math.PI / 2);
-  ctx.textAlign = 'center'; ctx.fillText('O(t)', 0, 0);
-  ctx.restore();
+  sideLabel(ps, 'Hz');
 
   // panel borders
-  ctx.strokeStyle = C.panelBorder;
-  ctx.strokeRect(L - 0.5, oy0 - 0.5, R - L + 1, oy1 - oy0 + 1);
-  ctx.strokeRect(L - 0.5, sy0 - 0.5, R - L + 1, sy1 - sy0 + 1);
+  ctx.strokeStyle = C.panelBorder; ctx.lineWidth = 1;
+  for (const p of panels) ctx.strokeRect(L - 0.5, p.y0 - 0.5, R - L + 1, p.h + 1);
+}
+
+// Revealed beats: lines through every panel, dots on the curves, and an arrow
+// from the current beat to its backlink.
+function drawBeats() {
+  const n = nShown();
+  if (!n) return;
+  const cIdx = curIdx(), t1 = state.t0 + visSec();
+  const pc = geo.p.cum, po = geo.p.onset;
+  ctx.save();
+  ctx.beginPath(); ctx.rect(geo.L, geo.top, geo.pw, geo.bottom - geo.top); ctx.clip();
+  for (let i = B - n; i < B; i++) {
+    const k = beats[i], t = onsetTime(k);
+    if (t < state.t0 - 1 || t > t1 + 1) continue;
+    const isCur = i === cIdx, x = snap(xOf(t));
+    ctx.strokeStyle = isCur ? C.beatCurrent : C.beat;
+    ctx.lineWidth = isCur ? 2.5 : 1.5;
+    ctx.beginPath(); ctx.moveTo(x, geo.top); ctx.lineTo(x, geo.bottom); ctx.stroke();
+    ctx.fillStyle = isCur ? C.beatCurrent : C.beat;
+    const r = isCur ? 5.5 : 4;
+    ctx.beginPath();
+    ctx.moveTo(x + r, cumY(cum[k])); ctx.arc(x, cumY(cum[k]), r, 0, 2 * Math.PI);
+    ctx.moveTo(x + r, onsetY(onset[k])); ctx.arc(x, onsetY(onset[k]), r, 0, 2 * Math.PI);
+    ctx.fill();
+  }
+  ctx.restore();
+
+  if (cIdx >= 0) {
+    const k = beats[cIdx], b = back[k];
+    if (b >= 0) {
+      clipPanel(pc);
+      arrowArc(pc, xOf(onsetTime(k)), cumY(cum[k]), xOf(onsetTime(b)), cumY(cum[b]),
+               C.beatCurrent, `P*(${k}) = ${b}`, C.beatCurrentText);
+      ctx.restore();
+    }
+  }
+}
+
+// Forward-pass explainer for the hovered frame: search window, candidate
+// scores C*(τ) + α·F(t−τ, τp), and the arrow to the winning τ = P*(t).
+function hoverFrame() {
+  const x = state.hoverX, y = state.hoverY;
+  if (x === null || x < geo.L || x > geo.R || y < geo.top || y > geo.bottom) return -1;
+  return clamp(onsetFrameAt(tOf(x)), 0, NO - 1);
+}
+function drawSearchWindow() {
+  if (stage() < 2 || drag?.moved) return;
+  const k = hoverFrame();
+  if (k < 0 || back[k] < 0) return;
+  const pc = geo.p.cum, pb = geo.p.back;
+  const a = k + pLo, b = k + pHi;
+  const xa = xOf(onsetTime(a) - hop / 2), xb = xOf(onsetTime(b) + hop / 2);
+  ctx.fillStyle = C.window;
+  for (const p of [pc, pb]) { clipPanel(p); ctx.fillRect(xa, p.y0, xb - xa, p.h); ctx.restore(); }
+
+  clipPanel(pc);
+  ctx.strokeStyle = C.candidate; ctx.lineWidth = 1.25; ctx.setLineDash([4, 3]);
+  ctx.beginPath();
+  for (let tau = a; tau <= b; tau++) {
+    const v = cum[tau] - ALPHA * Math.log((k - tau) / P) ** 2;
+    const x = xOf(onsetTime(tau)), y = cumY(v);
+    tau === a ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  }
+  ctx.stroke(); ctx.setLineDash([]);
+  const best = back[k];
+  const xBest = xOf(onsetTime(best));
+  ctx.fillStyle = C.hoverArc;
+  ctx.beginPath(); ctx.arc(xBest, cumY(cum[k] - onset[k]), 3.5, 0, 2 * Math.PI); ctx.fill();
+  arrowArc(pc, xOf(onsetTime(k)), cumY(cum[k]), xBest, cumY(cum[best]),
+           C.hoverArc, `P*(${k}) = ${best}`, C.bg);
+  ctx.restore();
 }
 
 function drawCursors() {
-  const { L, R, oy0, sy1 } = geo;
-  // hover
-  if (state.hoverX !== null && state.hoverX >= L && state.hoverX <= R) {
-    const t = tOf(state.hoverX);
-    const k = clamp(onsetFrameAt(t), 0, NO - 1);
+  const { L, R } = geo;
+  const k = hoverFrame();
+  if (k >= 0) {
     const x = snap(xOf(onsetTime(k))) + 0.5 / dpr;
     ctx.strokeStyle = C.hover; ctx.lineWidth = 1; ctx.setLineDash([3, 3]);
-    ctx.beginPath(); ctx.moveTo(x, oy0); ctx.lineTo(x, sy1); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(x, geo.top); ctx.lineTo(x, geo.bottom); ctx.stroke();
     ctx.setLineDash([]);
     ctx.strokeStyle = C.text; ctx.lineWidth = 1.5;
-    ctx.beginPath(); ctx.arc(xOf(onsetTime(k)), onsetY(onset[k]), 4.5, 0, 2 * Math.PI); ctx.stroke();
+    if (geo.p.onset) { ctx.beginPath(); ctx.arc(xOf(onsetTime(k)), onsetY(onset[k]), 4.5, 0, 2 * Math.PI); ctx.stroke(); }
+    if (geo.p.cum) { ctx.beginPath(); ctx.arc(xOf(onsetTime(k)), cumY(cum[k]), 4.5, 0, 2 * Math.PI); ctx.stroke(); }
   }
-  // playhead
-  const tp = displayTime();
-  const x = xOf(tp);
+  const x = xOf(displayTime());
   if (x >= L - 1 && x <= R + 1) {
     ctx.strokeStyle = C.playhead; ctx.lineWidth = 2;
-    ctx.beginPath(); ctx.moveTo(x, oy0); ctx.lineTo(x, sy1); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(x, geo.top); ctx.lineTo(x, geo.bottom); ctx.stroke();
     ctx.fillStyle = C.playhead;
-    ctx.beginPath(); ctx.moveTo(x - 6, oy0 - 1); ctx.lineTo(x + 6, oy0 - 1); ctx.lineTo(x, oy0 + 7); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(x - 6, geo.top - 1); ctx.lineTo(x + 6, geo.top - 1); ctx.lineTo(x, geo.top + 7); ctx.fill();
   }
 }
 
 function drawMain() {
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.fillStyle = C.bg; ctx.fillRect(0, 0, W, H);
+  const panels = PANELS.map(p => geo.p[p.id]).filter(Boolean);
   ctx.fillStyle = C.panel;
-  ctx.fillRect(geo.L, geo.oy0, geo.pw, LY.onsetH);
-  ctx.fillRect(geo.L, geo.sy0, geo.pw, LY.specH);
-  drawSpectrogram();
-  drawOnset();
+  for (const p of panels) ctx.fillRect(geo.L, p.y0, geo.pw, p.h);
+
+  const ps = geo.p.spec;
+  drawSpecInto(ctx, geo.L, geo.R, state.t0, state.pps, ps.y0, ps.h);
+  if (geo.p.onset) drawOnsetPanel(geo.p.onset);
+  if (geo.p.cum) drawCumPanel(geo.p.cum);
+  if (geo.p.back) drawBackPanel(geo.p.back);
   drawGridAndAxes();
-  panelTitle('Onset strength envelope  O(t)', geo.oy0);
-  panelTitle(`Mel spectrogram  ·  ${M} bands  ·  dB`, geo.sy0);
+  drawSearchWindow();
+  drawBeats();
+  for (const p of panels) {
+    let title = p.title;
+    if (p === geo.p.back) title += state.pps * hop >= CONFIG.backlinkNumbersAtPxPerFrame
+      ? '' : '  ·  plotted as gap t − P*(t) in frames (dashed: τp) · zoom in for values';
+    panelTitle(p, title);
+  }
   drawCursors();
 }
 
@@ -530,31 +887,103 @@ function drawOverview() {
   octx.setTransform(dpr, 0, 0, dpr, 0, 0);
   octx.fillStyle = C.bg; octx.fillRect(0, 0, W, OH);
   octx.fillStyle = C.panel; octx.fillRect(L, 2, pw, OH - 4);
-  // whole-song envelope, per-pixel max
-  const top = 4, bot = OH - 4, yOf = v => bot - clamp((v - oLo) / (oHi - oLo), 0, 1) * (bot - top);
-  const step = 1 / dpr, secPerPx = duration / pw;
-  octx.fillStyle = C.onset;
-  let k = 0;
-  for (let x = L; x < R; x += step) {
-    const tb = (x + step - L) * secPerPx;
-    let hi = -Infinity;
-    while (k < NO && onsetTime(k) < tb) { const v = onset[k++]; if (v > hi) hi = v; }
-    if (hi === -Infinity) continue;
-    const y = yOf(hi), y0 = yOf(Math.max(0, oLo));
-    octx.fillRect(x, y, step, Math.max(step, y0 - y));
+  if (stage() === 0) {
+    drawSpecInto(octx, L, R, 0, pw / duration, 2, OH - 4);
+  } else {
+    // whole-song envelope, per-pixel max
+    const top = 4, bot = OH - 4, yOf = v => bot - clamp((v - oLo) / (oHi - oLo), 0, 1) * (bot - top);
+    const step = 1 / dpr, secPerPx = duration / pw, y0 = yOf(Math.max(0, oLo));
+    octx.fillStyle = C.onset;
+    let k = 0;
+    for (let x = L; x < R; x += step) {
+      const tb = (x + step - L) * secPerPx;
+      let hi = -Infinity;
+      while (k < NO && onsetTime(k) < tb) { const v = onset[k++]; if (v > hi) hi = v; }
+      if (hi === -Infinity) continue;
+      const y = yOf(hi);
+      octx.fillRect(x, y, step, Math.max(step, y0 - y));
+    }
+  }
+  // revealed beats
+  const n = nShown(), cIdx = curIdx();
+  for (let i = B - n; i < B; i++) {
+    const x = L + onsetTime(beats[i]) / duration * pw;
+    octx.fillStyle = i === cIdx ? C.beatCurrent : C.beat;
+    octx.fillRect(x - (i === cIdx ? 1 : 0.5), 2, i === cIdx ? 2 : 1, 10);
   }
   // visible window
   const xa = L + state.t0 / duration * pw, xb = L + (state.t0 + visSec()) / duration * pw;
   octx.fillStyle = C.overviewWindow; octx.fillRect(xa, 1, xb - xa, OH - 2);
   octx.strokeStyle = C.overviewWindowBorder; octx.lineWidth = 1;
   octx.strokeRect(snap(xa) + 0.5 / dpr, 1.5, Math.max(2, xb - xa - 1), OH - 3);
-  // playhead
   const xp = L + displayTime() / duration * pw;
   octx.fillStyle = C.playhead; octx.fillRect(xp - 1, 0, 2, OH);
 }
 
 // ----------------------------------------------------------------------------
-// UI
+// Stage UI
+// ----------------------------------------------------------------------------
+const stageBtns = [...document.querySelectorAll('#stages button')];
+const prevBtn = document.getElementById('prev'), nextBtn = document.getElementById('next');
+const skipBtn = document.getElementById('skip'), stepCount = document.getElementById('step-count');
+const captionEl = document.getElementById('caption');
+
+function captionHTML() {
+  const s = state.step, f2 = v => v.toFixed(2), f3 = v => v.toFixed(3);
+  const base = { fr: Math.round(fr), M, P: Math.round(P), bpm: D.tempo.bpm.toFixed(1),
+                 alpha: ALPHA, w0: -pLo, w1: -pHi, B };
+  if (s === 0) return CAPTIONS.spec(base);
+  if (s === 1) return CAPTIONS.onset(base);
+  if (s === 2) return CAPTIONS.forward(base);
+  if (s === LAST) {
+    const meanGap = B > 1 ? (beats[B - 1] - beats[0]) / (B - 1) : NaN;
+    return CAPTIONS.done({ ...base, first: f2(onsetTime(beats[0])), last: f2(onsetTime(beats[B - 1])),
+      meanGap: meanGap.toFixed(1), meanSec: f3(meanGap * hop), meanBpm: (60 / (meanGap * hop)).toFixed(1) });
+  }
+  const k = beats[curIdx()];
+  return CAPTIONS.backtrace({ ...base, n: nShown(), k, t: f3(onsetTime(k)), c: cum[k].toFixed(1),
+                              prev: back[k], gap: k - back[k] });
+}
+
+function setStep(s) {
+  s = clamp(s, 0, LAST);
+  const oldStage = stage();
+  state.step = s;
+  if (stage() !== oldStage) {
+    if (stage() >= 2 && oldStage < 2) cumView.lo = cumView.hi = NaN;
+    layout();
+  }
+  stageBtns.forEach((b, i) => {
+    b.classList.toggle('active', i === stage());
+    b.classList.toggle('done', i < stage());
+  });
+  prevBtn.disabled = s === 0;
+  nextBtn.disabled = s === LAST;
+  skipBtn.disabled = s === LAST;
+  nextBtn.textContent = s < 2 ? 'Next ▶' : s === 2 ? 'Start backtrace ▶' : 'Next beat ▶';
+  stepCount.textContent = stage() === 3 ? `${nShown()} / ${B} beats` : '';
+  captionEl.innerHTML = captionHTML();
+
+  // Keep the current beat (and the beat it points to) in view.
+  const ci = curIdx();
+  if (ci >= 0 && !(state.follow && !audio.paused)) {
+    const k = beats[ci], t = onsetTime(k), v = visSec();
+    const tPrev = back[k] >= 0 ? onsetTime(back[k]) : t;
+    const fits = t - tPrev < v * 0.8;
+    const ok = t <= state.t0 + 0.95 * v && (fits ? tPrev >= state.t0 + 0.03 * v : t >= state.t0 + 0.05 * v);
+    if (!ok) panTo(t - CONFIG.backtraceBeatAt * v);
+  }
+  updateHover();
+  dirty = true;
+}
+
+stageBtns.forEach((b, i) => b.addEventListener('click', () => setStep(i)));
+prevBtn.addEventListener('click', () => setStep(state.step - 1));
+nextBtn.addEventListener('click', () => setStep(state.step + 1));
+skipBtn.addEventListener('click', () => setStep(LAST));
+
+// ----------------------------------------------------------------------------
+// Playback / view UI
 // ----------------------------------------------------------------------------
 const playBtn = document.getElementById('play');
 const clockEl = document.getElementById('clock');
@@ -570,19 +999,26 @@ function updateHover() {
   if (state.hoverX === null || state.hoverX < geo.L || state.hoverX > geo.R) {
     hoverInfo.innerHTML = '&nbsp;'; return;
   }
-  const t = tOf(state.hoverX);
+  const t = tOf(state.hoverX), st = stage();
   const k = clamp(onsetFrameAt(t), 0, NO - 1);
-  let s = `t = ${onsetTime(k).toFixed(3)} s · frame ${k} · O = ${onset[k].toFixed(3)}`;
-  const y = state.hoverY;
-  if (y >= geo.sy0 && y < geo.sy1) {
-    const band = clamp(Math.floor((geo.sy1 - y) / LY.specH * M), 0, M - 1);
+  const parts = [];
+  if (st === 0) parts.push(`t = ${t.toFixed(3)} s`);
+  else {
+    parts.push(`t = ${onsetTime(k).toFixed(3)} s`, `frame ${k}`, `O = ${onset[k].toFixed(3)}`);
+    if (st >= 2) parts.push(`C* = ${cum[k].toFixed(2)}`, `P* = ${back[k]}`);
+    if (st >= 3 && beatRank[k] >= 0 && revealed(k)) parts.push('beat');
+  }
+  const y = state.hoverY, ps = geo.p.spec;
+  if (y >= ps.y0 && y < ps.y1) {
+    const band = clamp(Math.floor((ps.y1 - y) / ps.h * M), 0, M - 1);
     const j = clamp(specColAt(t), 0, T - 1);
     const db = mel[j * M + band] / 255 * (D.melDb.max - D.melDb.min) + D.melDb.min - D.melDb.max;
-    s += ` · band ${band} (≈${Math.round(D.melCentersHz[band])} Hz) · ${db.toFixed(1)} dB re max`;
+    parts.push(`band ${band} (≈${Math.round(D.melCentersHz[band])} Hz)`, `${db.toFixed(1)} dB re max`);
   }
-  hoverInfo.textContent = s;
+  hoverInfo.textContent = parts.join(' · ');
 }
 function setFollow(on) { state.follow = on; followBox.checked = on; dirty = true; }
+function userMovedView() { tween = null; if (!audio.paused) setFollow(false); }
 function seek(t) {
   audio.currentTime = clamp(t, 0, duration);
   lastCT = -1;
@@ -595,31 +1031,38 @@ function togglePlay() {
   } else audio.pause();
 }
 function zoomAt(factor, x) {
+  tween = null;
   const t = tOf(x);
   state.pps = clamp(state.pps * factor, minPps, maxPps);
   state.t0 = t - (x - geo.L) / state.pps;
   clampView(); dirty = true;
 }
 function zoomButton(factor) {
-  const xp = xOf(displayTime());
-  zoomAt(factor, xp >= geo.L && xp <= geo.R ? xp : (geo.L + geo.R) / 2);
+  // anchor on the current beat in the backtrace, else the playhead, else centre
+  const ci = curIdx();
+  const anchors = [ci >= 0 ? xOf(onsetTime(beats[ci])) : NaN, xOf(displayTime())];
+  const x = anchors.find(a => a >= geo.L && a <= geo.R) ?? (geo.L + geo.R) / 2;
+  zoomAt(factor, x);
 }
-function fit() { state.pps = minPps; state.t0 = 0; dirty = true; }
+function fit() { tween = null; state.pps = minPps; state.t0 = 0; dirty = true; }
 
-audio.src = D.audio;
+// D.audio is relative to the song's folder, not to this page.
+audio.src = new URL(D.audio, new URL(`${encodeURIComponent(songId)}/`, location.href)).href;
 audio.addEventListener('play', () => { playBtn.textContent = '❚❚ Pause'; dirty = true; });
 audio.addEventListener('pause', () => { playBtn.textContent = '▶ Play'; dirty = true; });
 audio.addEventListener('seeked', () => { dirty = true; });
 audio.addEventListener('error', () => {
-  hoverInfo.textContent = `Could not load audio "${decodeURI(D.audio)}" (relative to viz/).`;
+  hoverInfo.textContent = `Could not load audio "${decodeURI(D.audio)}" (relative to viz/${songId}/). Re-run export_viz.py for this song.`;
 });
 
-playBtn.addEventListener('click', () => { togglePlay(); playBtn.blur(); });
+playBtn.addEventListener('click', togglePlay);
 document.getElementById('rate').addEventListener('change', e => { audio.playbackRate = +e.target.value; e.target.blur(); });
 followBox.addEventListener('change', () => { setFollow(followBox.checked); followBox.blur(); });
-document.getElementById('zoom-in').addEventListener('click', e => { zoomButton(1.5); e.target.blur(); });
-document.getElementById('zoom-out').addEventListener('click', e => { zoomButton(1 / 1.5); e.target.blur(); });
-document.getElementById('zoom-fit').addEventListener('click', e => { fit(); e.target.blur(); });
+document.getElementById('zoom-in').addEventListener('click', () => zoomButton(1.5));
+document.getElementById('zoom-out').addEventListener('click', () => zoomButton(1 / 1.5));
+document.getElementById('zoom-fit').addEventListener('click', fit);
+// Don't leave buttons focused, so Space / arrows always reach the page.
+document.querySelectorAll('button').forEach(b => b.addEventListener('click', () => b.blur()));
 
 // main canvas: drag to pan, click to seek, wheel to pan/zoom
 let drag = null;
@@ -632,11 +1075,8 @@ cv.addEventListener('pointermove', e => {
   [state.hoverX, state.hoverY] = localXY(e);
   if (drag) {
     const dx = e.clientX - drag.x;
-    if (Math.abs(dx) > 3) { drag.moved = true; cv.classList.add('dragging'); }
-    if (drag.moved) {
-      state.t0 = drag.t0 - dx / state.pps; clampView();
-      if (!audio.paused) setFollow(false);
-    }
+    if (!drag.moved && Math.abs(dx) > 3) { drag.moved = true; cv.classList.add('dragging'); userMovedView(); }
+    if (drag.moved) { state.t0 = drag.t0 - dx / state.pps; clampView(); }
   }
   updateHover(); dirty = true;
 });
@@ -645,20 +1085,21 @@ cv.addEventListener('pointerup', e => {
     const [x] = localXY(e);
     if (x >= geo.L && x <= geo.R) seek(tOf(x));
   }
-  drag = null; cv.classList.remove('dragging');
+  drag = null; cv.classList.remove('dragging'); dirty = true;
 });
 cv.addEventListener('pointerleave', () => { state.hoverX = null; updateHover(); dirty = true; });
 cv.addEventListener('wheel', e => {
   e.preventDefault();
   const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? geo.pw : 1;
   const dx = e.deltaX * unit, dy = e.deltaY * unit;
+  userMovedView();
   if (e.ctrlKey || e.metaKey) {
     zoomAt(Math.exp(-dy * 0.01), localXY(e)[0]);
   } else {
     state.t0 += (Math.abs(dx) > Math.abs(dy) ? dx : dy) / state.pps;
     clampView();
   }
-  if (!audio.paused) setFollow(false);
+  updateHover();
   dirty = true;
 }, { passive: false });
 
@@ -666,9 +1107,9 @@ cv.addEventListener('wheel', e => {
 let ovDrag = false;
 function overviewTo(e) {
   const x = e.clientX - ov.getBoundingClientRect().left;
+  userMovedView();
   state.t0 = (x - geo.L) / geo.pw * duration - visSec() / 2;
   clampView();
-  if (!audio.paused) setFollow(false);
   dirty = true;
 }
 ov.addEventListener('pointerdown', e => { ov.setPointerCapture(e.pointerId); ovDrag = true; overviewTo(e); });
@@ -676,22 +1117,34 @@ ov.addEventListener('pointermove', e => { if (ovDrag) overviewTo(e); });
 ov.addEventListener('pointerup', () => { ovDrag = false; });
 
 window.addEventListener('keydown', e => {
-  if (e.target.tagName === 'SELECT' || e.target.tagName === 'INPUT' || e.metaKey || e.ctrlKey) return;
+  if (e.target.tagName === 'SELECT' || e.target.tagName === 'INPUT' || e.metaKey || e.ctrlKey || e.altKey) return;
   switch (e.key) {
     case ' ': e.preventDefault(); togglePlay(); break;
+    case 'ArrowRight': case 'PageDown': case 'n': e.preventDefault(); setStep(state.step + 1); break;
+    case 'ArrowLeft': case 'PageUp': case 'p': e.preventDefault(); setStep(state.step - 1); break;
+    case 'End': e.preventDefault(); setStep(LAST); break;
     case '+': case '=': zoomButton(1.5); break;
     case '-': case '_': zoomButton(1 / 1.5); break;
     case '0': fit(); break;
     case 'f': case 'F': setFollow(!state.follow); break;
-    case 'Home': seek(0); state.t0 = 0; break;
+    case 'Home': e.preventDefault(); seek(0); tween = null; state.t0 = 0; dirty = true; break;
   }
 });
 window.addEventListener('resize', layout);
 
 // ----------------------------------------------------------------------------
-// Render loop: redraw only when something changed or audio is playing
+// Render loop: redraw only when something changed, audio is playing, or a
+// pan / rescale animation is running.
 // ----------------------------------------------------------------------------
-function frame() {
+function frame(now) {
+  if (tween) {
+    const u = Math.min(1, (now - tween.start) / tween.dur), e = 1 - Math.pow(1 - u, 3);
+    state.t0 = tween.from + (tween.to - tween.from) * e;
+    clampView();
+    if (u >= 1) tween = null;
+    updateHover();
+    dirty = true;
+  }
   if (!audio.paused) {
     if (state.follow) {
       state.t0 = displayTime() - CONFIG.followAt * visSec();
@@ -708,8 +1161,18 @@ function frame() {
   requestAnimationFrame(frame);
 }
 layout();
+setStep(0);
 requestAnimationFrame(frame);
-})();
+
+// Debug / screenshot hook: index.html#step=5&view=12.5,4 (step, start s, seconds visible)
+const hash = new URLSearchParams(location.hash.slice(1));
+if (hash.has('view')) {
+  const [t0, vs] = hash.get('view').split(',').map(Number);
+  state.pps = clamp(geo.pw / vs, minPps, maxPps); state.t0 = t0; clampView();
+}
+if (hash.has('step')) setStep(+hash.get('step'));
+if (hash.has('hover')) { const [hx, hy] = hash.get('hover').split(',').map(Number); state.hoverX = hx; state.hoverY = hy; updateHover(); }
+}
 </script>
 </body>
 </html>
