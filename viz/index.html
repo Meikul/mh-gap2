@@ -18,6 +18,7 @@
     --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
   }
   * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
   body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.4 var(--font); }
   header { padding: 18px 20px 6px; display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap; }
   header h1 { margin: 0; font-size: 20px; font-weight: 600; }
@@ -104,6 +105,7 @@
       </select>
     </label>
     <label title="Keep the playhead in view while playing (F)"><input type="checkbox" id="follow" checked> Follow playhead</label>
+    <label id="clicks-wrap" title="Play a click on each revealed beat (C)" hidden><input type="checkbox" id="clicks"> Beat clicks</label>
     <span class="spacer"></span>
     <button id="zoom-out" title="Zoom out (−)">−</button>
     <span id="zoom-label"></span>
@@ -156,6 +158,15 @@ const CONFIG = {
   // Shift the drawn playhead to compensate for output latency (e.g. Bluetooth/HDMI)
   audioLatencyMs: 0,
 
+  // Backtrace stage: click sound on revealed beats, and a glow when the playhead hits one
+  beatClicks: {
+    freq: 1500,             // Hz; pitch glides down an octave over the click
+    volume: 0.5,            // 0..1
+    lengthMs: 70,
+    offsetMs: 0,            // nudge if the clicks sound early (−) or late (+) against the music
+  },
+  pulseMs: 300,             // how long the playhead glow lasts
+
   font: '12px ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif',
   titleFont: '600 12px ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif',
   monoFont: '10.5px ui-monospace, "SF Mono", Menlo, Consolas, monospace',
@@ -185,6 +196,9 @@ const CONFIG = {
     hoverArc: '#ffffff',
     playhead: '#ff4d6d',
     hover: 'rgba(255,255,255,0.45)',
+    pulseGlow: 'rgba(255,224,102,0.38)',
+    pulseGlowEdge: 'rgba(255,224,102,0)',
+    pulseRing: '#ffe066',
     titleBg: 'rgba(15,17,21,0.72)',
     overviewWindow: 'rgba(255,255,255,0.10)',
     overviewWindowBorder: 'rgba(255,255,255,0.55)',
@@ -849,6 +863,7 @@ function drawCursors() {
     if (geo.p.onset) { ctx.beginPath(); ctx.arc(xOf(onsetTime(k)), onsetY(onset[k]), 4.5, 0, 2 * Math.PI); ctx.stroke(); }
     if (geo.p.cum) { ctx.beginPath(); ctx.arc(xOf(onsetTime(k)), cumY(cum[k]), 4.5, 0, 2 * Math.PI); ctx.stroke(); }
   }
+  drawPulses();
   const x = xOf(displayTime());
   if (x >= L - 1 && x <= R + 1) {
     ctx.strokeStyle = C.playhead; ctx.lineWidth = 2;
@@ -963,6 +978,8 @@ function setStep(s) {
   nextBtn.textContent = s < 2 ? 'Next ▶' : s === 2 ? 'Start backtrace ▶' : 'Next beat ▶';
   stepCount.textContent = stage() === 3 ? `${nShown()} / ${B} beats` : '';
   captionEl.innerHTML = captionHTML();
+  clickWrap.hidden = stage() !== 3;
+  resetClicks();   // the set of revealed beats changed
 
   // Keep the current beat (and the beat it points to) in view.
   const ci = curIdx();
@@ -1025,6 +1042,7 @@ function seek(t) {
   dirty = true;
 }
 function togglePlay() {
+  if (clickBox.checked) ensureAudioCtx();   // needs a user gesture to start
   if (audio.paused) {
     if (audio.currentTime >= duration - 0.01) audio.currentTime = 0;
     audio.play();
@@ -1127,10 +1145,113 @@ window.addEventListener('keydown', e => {
     case '-': case '_': zoomButton(1 / 1.5); break;
     case '0': fit(); break;
     case 'f': case 'F': setFollow(!state.follow); break;
+    case 'c': case 'C':
+      if (stage() === 3) { clickBox.checked = !clickBox.checked; clickBox.dispatchEvent(new Event('change')); }
+      break;
     case 'Home': e.preventDefault(); seek(0); tween = null; state.t0 = 0; dirty = true; break;
   }
 });
 window.addEventListener('resize', layout);
+
+// ----------------------------------------------------------------------------
+// Backtrace stage: click sounds and playhead pulses on revealed beats.
+// Clicks are scheduled on the Web Audio clock a little ahead of time (so they
+// don't jitter with the frame rate), mapped from the <audio> element's clock.
+// ----------------------------------------------------------------------------
+const clickBox = document.getElementById('clicks');
+const clickWrap = document.getElementById('clicks-wrap');
+const beatTimes = beats.map(onsetTime);
+const LOOKAHEAD = 0.12;    // seconds of real time scheduled ahead
+let actx = null, scheduled = [], schedUntil = -Infinity, lastPulseT = null, pulses = [];
+
+function firstBeatAfter(t) {   // index of the first beat with time > t
+  let lo = 0, hi = B;
+  while (lo < hi) { const m = (lo + hi) >> 1; if (beatTimes[m] <= t) lo = m + 1; else hi = m; }
+  return lo;
+}
+function ensureAudioCtx() {
+  if (!actx) {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return null;
+    actx = new AC();
+  }
+  if (actx.state === 'suspended') actx.resume();
+  return actx;
+}
+function scheduleClick(when) {
+  const bc = CONFIG.beatClicks, len = bc.lengthMs / 1000;
+  when = Math.max(when, actx.currentTime);
+  const o = actx.createOscillator(), g = actx.createGain();
+  o.type = 'sine';
+  o.frequency.setValueAtTime(bc.freq, when);
+  o.frequency.exponentialRampToValueAtTime(bc.freq / 2, when + len);
+  g.gain.setValueAtTime(0.0001, when);
+  g.gain.exponentialRampToValueAtTime(Math.max(0.0002, bc.volume), when + 0.002);
+  g.gain.exponentialRampToValueAtTime(0.0001, when + len);
+  o.connect(g).connect(actx.destination);
+  o.start(when); o.stop(when + len + 0.01);
+  scheduled.push({ o, when });
+}
+// Forget (and silence) anything scheduled: on pause, seek, rate change or step change.
+function resetClicks() {
+  if (actx) {
+    const now = actx.currentTime;
+    for (const s of scheduled) if (s.when > now) { try { s.o.stop(); } catch (e) { /* already stopped */ } }
+  }
+  scheduled = []; schedUntil = -Infinity; lastPulseT = null;
+}
+// Called every frame while the audio is playing.
+function updateBeats() {
+  if (stage() !== 3 || nShown() === 0) return;
+  const first = B - nShown();               // revealed beats are beats[first..B-1]
+
+  if (clickBox.checked && actx) {
+    const mt = playTime(), rate = audio.playbackRate;
+    const horizon = mt + LOOKAHEAD * rate;   // in media seconds
+    for (let i = Math.max(first, firstBeatAfter(Math.max(schedUntil, mt))); i < B && beatTimes[i] <= horizon; i++)
+      scheduleClick(actx.currentTime + (beatTimes[i] - mt) / rate + CONFIG.beatClicks.offsetMs / 1000);
+    schedUntil = horizon;
+    scheduled = scheduled.filter(s => s.when > actx.currentTime - 1);
+  }
+
+  // A pulse for every revealed beat the drawn playhead crossed since last frame
+  // (skipped after a jump, so seeking doesn't fire a burst of pulses).
+  const dt = displayTime();
+  if (lastPulseT !== null && dt >= lastPulseT && dt - lastPulseT < 0.25) {
+    for (let i = Math.max(first, firstBeatAfter(lastPulseT)); i < B && beatTimes[i] <= dt; i++)
+      pulses.push({ k: beats[i], start: performance.now() });
+  }
+  lastPulseT = dt;
+}
+function drawPulses() {
+  if (!pulses.length) return;
+  const now = performance.now(), dur = CONFIG.pulseMs;
+  pulses = pulses.filter(p => now - p.start < dur);
+  ctx.save();
+  ctx.beginPath(); ctx.rect(geo.L, geo.top, geo.pw, geo.bottom - geo.top); ctx.clip();
+  for (const p of pulses) {
+    const u = (now - p.start) / dur, x = xOf(onsetTime(p.k)), w = 10 + 28 * u;
+    ctx.globalAlpha = 1 - u;
+    const g = ctx.createLinearGradient(x - w, 0, x + w, 0);
+    g.addColorStop(0, C.pulseGlowEdge); g.addColorStop(0.5, C.pulseGlow); g.addColorStop(1, C.pulseGlowEdge);
+    ctx.fillStyle = g;
+    ctx.fillRect(x - w, geo.top, 2 * w, geo.bottom - geo.top);
+    ctx.strokeStyle = C.pulseRing; ctx.lineWidth = 2;
+    const r = 6 + 16 * u;
+    for (const y of [cumY(cum[p.k]), onsetY(onset[p.k])]) {
+      ctx.beginPath(); ctx.arc(x, y, r, 0, 2 * Math.PI); ctx.stroke();
+    }
+  }
+  ctx.restore();
+  if (pulses.length) dirty = true;   // keep animating the fade
+}
+
+clickBox.addEventListener('change', () => {
+  if (clickBox.checked) ensureAudioCtx();
+  resetClicks();
+  clickBox.blur();
+});
+for (const ev of ['play', 'pause', 'seeking', 'ratechange']) audio.addEventListener(ev, resetClicks);
 
 // ----------------------------------------------------------------------------
 // Render loop: redraw only when something changed, audio is playing, or a
@@ -1150,6 +1271,7 @@ function frame(now) {
       state.t0 = displayTime() - CONFIG.followAt * visSec();
       clampView();
     }
+    updateBeats();
     dirty = true;
   }
   if (dirty) {
