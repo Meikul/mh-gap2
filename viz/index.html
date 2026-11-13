@@ -106,6 +106,10 @@
     </label>
     <label title="Keep the playhead in view while playing (F)"><input type="checkbox" id="follow" checked> Follow playhead</label>
     <label id="clicks-wrap" title="Play a click on each revealed beat (C)" hidden><input type="checkbox" id="clicks"> Beat clicks</label>
+    <label id="offset-wrap" title="Delay the clicks relative to the music. Raise it if clicks come early, lower it if they come late." hidden>
+      offset <input type="range" id="click-offset" min="-150" max="400" step="5" style="width:110px">
+      <span id="click-offset-val" style="font-family:var(--mono);font-size:13px;min-width:56px"></span>
+    </label>
     <span class="spacer"></span>
     <button id="zoom-out" title="Zoom out (−)">−</button>
     <span id="zoom-label"></span>
@@ -160,10 +164,13 @@ const CONFIG = {
 
   // Backtrace stage: click sound on revealed beats, and a glow when the playhead hits one
   beatClicks: {
-    freq: 1500,             // Hz; pitch glides down an octave over the click
-    volume: 0.5,            // 0..1
-    lengthMs: 70,
-    offsetMs: 0,            // nudge if the clicks sound early (−) or late (+) against the music
+    tickHz: 1600,           // centre of the band-passed noise burst (the "click")
+    tickQ: 1.2,             // higher = more pitched / ringy, lower = more like a snap
+    bodyHz: 520,            // short low tone under the tick, for a woodblock-ish knock
+    bodyMix: 0.5,           // body level relative to the tick (0 = tick only)
+    volume: 0.8,            // 0..1
+    lengthMs: 35,           // decay time
+    offsetMs: -30,          // default delay vs. the music (−30 ≈ MacBook speakers); the slider overrides this (saved per browser)
   },
   pulseMs: 300,             // how long the playhead glow lasts
 
@@ -979,6 +986,7 @@ function setStep(s) {
   stepCount.textContent = stage() === 3 ? `${nShown()} / ${B} beats` : '';
   captionEl.innerHTML = captionHTML();
   clickWrap.hidden = stage() !== 3;
+  offsetWrap.hidden = stage() !== 3;
   resetClicks();   // the set of revealed beats changed
 
   // Keep the current beat (and the beat it points to) in view.
@@ -1160,9 +1168,29 @@ window.addEventListener('resize', layout);
 // ----------------------------------------------------------------------------
 const clickBox = document.getElementById('clicks');
 const clickWrap = document.getElementById('clicks-wrap');
+const offsetWrap = document.getElementById('offset-wrap');
+const offsetInput = document.getElementById('click-offset');
+const offsetVal = document.getElementById('click-offset-val');
 const beatTimes = beats.map(onsetTime);
-const LOOKAHEAD = 0.12;    // seconds of real time scheduled ahead
-let actx = null, scheduled = [], schedUntil = -Infinity, lastPulseT = null, pulses = [];
+const LOOKAHEAD = 0.12;    // seconds of real time scheduled ahead (on top of the offset)
+let actx = null, noiseBuf = null, scheduled = [], schedUntil = -Infinity, lastPulseT = null, pulses = [];
+
+// Click offset: slider value, remembered in this browser (falls back to CONFIG).
+const OFFSET_KEY = 'beatviz.clickOffsetMs';
+let clickOffsetMs = CONFIG.beatClicks.offsetMs;
+try { const v = localStorage.getItem(OFFSET_KEY); if (v !== null && isFinite(+v)) clickOffsetMs = +v; } catch (e) { /* storage blocked */ }
+function showOffset() {
+  offsetInput.value = clickOffsetMs;
+  offsetVal.textContent = `${clickOffsetMs > 0 ? '+' : ''}${clickOffsetMs} ms`;
+}
+showOffset();
+offsetInput.addEventListener('input', () => {
+  clickOffsetMs = +offsetInput.value;
+  showOffset();
+  try { localStorage.setItem(OFFSET_KEY, String(clickOffsetMs)); } catch (e) { /* storage blocked */ }
+  resetClicks();
+});
+offsetInput.addEventListener('change', () => offsetInput.blur());
 
 function firstBeatAfter(t) {   // index of the first beat with time > t
   let lo = 0, hi = B;
@@ -1178,25 +1206,40 @@ function ensureAudioCtx() {
   if (actx.state === 'suspended') actx.resume();
   return actx;
 }
+// Woodblock-style click: a band-passed noise burst (the sharp "tick") plus a
+// very short low sine (the "knock"), both with an instant attack.
 function scheduleClick(when) {
-  const bc = CONFIG.beatClicks, len = bc.lengthMs / 1000;
+  const bc = CONFIG.beatClicks, len = bc.lengthMs / 1000, vol = Math.max(0.0002, bc.volume);
   when = Math.max(when, actx.currentTime);
-  const o = actx.createOscillator(), g = actx.createGain();
-  o.type = 'sine';
-  o.frequency.setValueAtTime(bc.freq, when);
-  o.frequency.exponentialRampToValueAtTime(bc.freq / 2, when + len);
-  g.gain.setValueAtTime(0.0001, when);
-  g.gain.exponentialRampToValueAtTime(Math.max(0.0002, bc.volume), when + 0.002);
-  g.gain.exponentialRampToValueAtTime(0.0001, when + len);
-  o.connect(g).connect(actx.destination);
-  o.start(when); o.stop(when + len + 0.01);
-  scheduled.push({ o, when });
+  if (!noiseBuf) {
+    noiseBuf = actx.createBuffer(1, Math.ceil(actx.sampleRate * 0.1), actx.sampleRate);
+    const d = noiseBuf.getChannelData(0);
+    for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+  }
+  const noise = actx.createBufferSource(), bp = actx.createBiquadFilter(), gn = actx.createGain();
+  noise.buffer = noiseBuf;
+  bp.type = 'bandpass'; bp.frequency.value = bc.tickHz; bp.Q.value = bc.tickQ;
+  gn.gain.setValueAtTime(vol, when);
+  gn.gain.exponentialRampToValueAtTime(0.0001, when + len);
+  noise.connect(bp).connect(gn).connect(actx.destination);
+  noise.start(when); noise.stop(when + len + 0.01);
+  const nodes = [noise];
+  if (bc.bodyMix > 0) {
+    const o = actx.createOscillator(), go = actx.createGain();
+    o.type = 'sine'; o.frequency.value = bc.bodyHz;
+    go.gain.setValueAtTime(Math.max(0.0002, vol * bc.bodyMix), when);
+    go.gain.exponentialRampToValueAtTime(0.0001, when + len * 0.8);
+    o.connect(go).connect(actx.destination);
+    o.start(when); o.stop(when + len + 0.01);
+    nodes.push(o);
+  }
+  scheduled.push({ nodes, when });
 }
 // Forget (and silence) anything scheduled: on pause, seek, rate change or step change.
 function resetClicks() {
   if (actx) {
     const now = actx.currentTime;
-    for (const s of scheduled) if (s.when > now) { try { s.o.stop(); } catch (e) { /* already stopped */ } }
+    for (const s of scheduled) if (s.when > now) for (const n of s.nodes) { try { n.stop(); } catch (e) { /* already stopped */ } }
   }
   scheduled = []; schedUntil = -Infinity; lastPulseT = null;
 }
@@ -1205,11 +1248,15 @@ function updateBeats() {
   if (stage() !== 3 || nShown() === 0) return;
   const first = B - nShown();               // revealed beats are beats[first..B-1]
 
-  if (clickBox.checked && actx) {
-    const mt = playTime(), rate = audio.playbackRate;
-    const horizon = mt + LOOKAHEAD * rate;   // in media seconds
-    for (let i = Math.max(first, firstBeatAfter(Math.max(schedUntil, mt))); i < B && beatTimes[i] <= horizon; i++)
-      scheduleClick(actx.currentTime + (beatTimes[i] - mt) / rate + CONFIG.beatClicks.offsetMs / 1000);
+  // (wait for the context to be running: while suspended its clock is frozen)
+  if (clickBox.checked && actx && actx.state === 'running') {
+    const mt = playTime(), rate = audio.playbackRate, off = clickOffsetMs / 1000;
+    // Schedule beats whose click time (beat + offset, in media seconds) falls in
+    // (from, horizon]: not already scheduled, not in the past, within LOOKAHEAD.
+    const from = Math.max(schedUntil, mt);
+    const horizon = mt + LOOKAHEAD * rate;
+    for (let i = Math.max(first, firstBeatAfter(from - off * rate)); i < B && beatTimes[i] + off * rate <= horizon; i++)
+      scheduleClick(actx.currentTime + (beatTimes[i] - mt) / rate + off);
     schedUntil = horizon;
     scheduled = scheduled.filter(s => s.when > actx.currentTime - 1);
   }
