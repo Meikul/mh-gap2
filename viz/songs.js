@@ -1,9 +1,5 @@
 window.VIZ_SONGS = [
   {
-    "id": "bluey",
-    "title": "Bluey Theme Song"
-  },
-  {
     "id": "monkeys",
     "title": "Monkeys Spinning Monkeys"
   },
